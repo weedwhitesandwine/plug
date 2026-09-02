@@ -832,7 +832,7 @@ def install_scripts(root):
         named = bool(INSTALL_SCRIPT_NAMES.match(name))
         # Scored at full weight here on purpose: this is the report on the
         # script itself, where the whole point is to say what it does. The
-        # light weighting belongs to the plugin's trust dot, not to this.
+        # light weighting belongs to the plugin's trust mark, not to this.
         sc = scan_plugin(root, only_files=[os.path.join(root, name)],
                          light_files=set())
         try:

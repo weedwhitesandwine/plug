@@ -22,7 +22,8 @@ English, whether it is safe.
   show just the on/off switch, lined up with the community rows (a built-in is
   part of Omarchy, not an installed copy, so there is nothing to update or
   remove).
-- **The trust dot** on each row is a quick capability read of the plugin's
+- **The trust mark** on each row — a check, a circle, or an exclamation —
+  is a quick capability read of the plugin's
   source — what it can reach, run and write — and it is one of three things,
   never a number:
   - ✅ **Green check — squeaky clean.** Nothing that leaves the machine, nothing

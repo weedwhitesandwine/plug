@@ -99,7 +99,7 @@ Item {
   readonly property color fainter: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.35)
   readonly property color hairline: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.14)
 
-  // Semantic colours for the verdict and trust dots — fixed, not theme, so a
+  // Semantic colours for the verdict and trust marks — fixed, not theme, so a
   // green verdict is green on every theme. Picked for contrast on dark and
   // light alike.
   readonly property color okColor: "#3fb950"
