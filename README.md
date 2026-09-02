@@ -25,14 +25,15 @@ English, whether it is safe.
 - **The trust dot** on each row is a quick capability read of the plugin's
   source — what it can reach, run and write — and it is one of three things,
   never a number:
-  - 🟢 **Green — squeaky clean.** Nothing that leaves the machine, nothing
+  - ✅ **Green check — squeaky clean.** Nothing that leaves the machine, nothing
     alarming even mentioned, no install step. It keeps to itself.
-  - 🔴 **Red — something with no innocent reading at all.** Code that
+  - ❗ **Red exclamation — read it before installing.** Not a stop sign:
+    a warning that this needs your eyes. Code that Code that
     *actually runs* one of: reading private files (`.ssh`, `id_rsa`, `.gnupg`,
     keyring, `/etc/shadow`), or hiding itself behind an encoder (`atob`,
     `eval`, a packed line). No listed plugin is expected to be red. If it
     appears, read the code before anything else.
-  - 🟡 **Amber — the honest middle.** It reaches the network, ships an
+  - 🟡 **Amber circle — the honest middle.** It reaches the network, ships an
     install step, runs privileged commands (`sudo`/`pkexec`) or a package
     manager, or merely *displays* any of those for you to copy — the reason
     on the row says which. A capability held openly is not an accusation;

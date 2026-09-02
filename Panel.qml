@@ -1842,12 +1842,30 @@ Item {
       anchors.rightMargin: Style.space(8)
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.space(8)
-      // trust dot — community plugins only; official ones are not scanned.
-      Rectangle {
+      // trust mark — community plugins only; official ones are not scanned.
+      // A check for clean, a circle for the honest middle, an exclamation
+      // for red: a warning to read the code first, not a stop sign, which
+      // is why red is not a filled circle.
+      Item {
         visible: !(rowData && rowData.official)
-        width: Style.space(9); height: Style.space(9); radius: width / 2
+        width: Style.space(9); height: Style.space(9)
         anchors.verticalCenter: parent.verticalCenter
-        color: rowData ? root.trustColor(rowData.trustBand) : root.fainter
+        readonly property string band: rowData ? rowData.trustBand : ""
+        Rectangle {
+          visible: parent.band !== "green" && parent.band !== "red"
+          anchors.fill: parent; radius: width / 2
+          color: parent.band === "amber" ? root.warnColor : root.fainter
+        }
+        Text {
+          visible: parent.band === "green" || parent.band === "red"
+          anchors.centerIn: parent
+          text: parent.band === "green" ? "✓" : "!"
+          textFormat: Text.PlainText
+          color: parent.band === "green" ? root.okColor : root.dangerColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+        }
       }
       Column {
         anchors.verticalCenter: parent.verticalCenter
@@ -1884,10 +1902,13 @@ Item {
               : rowData.official ? (rowData.kinds || "built-in")
               : rowData.updateAvailable ? (rowData.commitsBehind + " new change" + (rowData.commitsBehind === 1 ? "" : "s") + " · press update to review")
               : rowData.iconHidden ? "on · bar icon hidden"
-              // What the dot is about, in words. A colour on its own is the
+              // What the mark is about, in words. A colour on its own is the
               // thing that made the old number useless — you could see that
               // Plug disapproved and not what of. The id is the least useful
-              // line on the row, so it is what gives way.
+              // line on the row, so it is what gives way. Red leads with the
+              // ask — read it — because it is a warning, not a verdict.
+              : rowData.trustBand === "red" && rowData.trustWhy
+                ? ("read it before installing — " + rowData.trustWhy)
               : rowData.trustWhy ? rowData.trustWhy
               : (rowData.id + (rowData.kinds ? " · " + rowData.kinds : ""))
           textFormat: Text.PlainText
