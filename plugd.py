@@ -462,11 +462,16 @@ def trust_why(hits, mentions, light, light_files):
         why.append("runs " + ", ".join(CAP_SHORT.get(c, c) for c in ran))
     if any(c in hits or c in mentions for c in REACHES_OUT):
         why.append("reaches the network")
-    if light_files:
-        why.append("installs by hand")
-    # Only what the plugin displays. What an install script does is already
-    # said by "installs by hand", and calling it "shows you a package manager"
-    # described the opposite of what that script does.
+    # A shipped script counts for what is in it, not for existing: a plugin's
+    # test harness is an unreferenced script too, and labelling Ripcord's
+    # tests an install step had the row asserting a setup ritual the README
+    # never asks for. Only a script that actually does setup-shaped things —
+    # a package manager, privilege, persistence — earns the words.
+    if any(c in light for c in ALARMING):
+        why.append("has a setup script")
+    # Only what the plugin displays. What a setup script does is already
+    # said by "has a setup script", and calling it "shows you a package
+    # manager" described the opposite of what that script does.
     quoted = [c for c in ALARMING if c in mentions]
     if quoted:
         why.append("shows you " + ", ".join(CAP_SHORT.get(c, c) for c in quoted))
@@ -487,7 +492,10 @@ def trust_band(hits, mentions, light, light_files):
     ran_alarm = any(c in hits for c in ALARMING)
     quoted_alarm = any(c in mentions or c in light for c in ALARMING)
     reaches = any(c in hits or c in mentions for c in REACHES_OUT)
-    if ran_alarm or quoted_alarm or reaches or light_files:
+    # A shipped script bands by its contents (the `light` term above), never
+    # by existing: an unreferenced script with nothing alarming in it is a
+    # test harness, not an install step, and existence is not evidence.
+    if ran_alarm or quoted_alarm or reaches:
         return TRUST_AMBER
     return TRUST_GREEN
 

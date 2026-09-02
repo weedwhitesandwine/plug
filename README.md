@@ -33,8 +33,8 @@ English, whether it is safe.
     keyring, `/etc/shadow`), or hiding itself behind an encoder (`atob`,
     `eval`, a packed line). No listed plugin is expected to be red. If it
     appears, read the code before anything else.
-  - 🟡 **Amber circle — the honest middle.** It reaches the network, ships an
-    install step, runs privileged commands (`sudo`/`pkexec`) or a package
+  - 🟡 **Amber circle — the honest middle.** It reaches the network, has a setup
+    script that installs or escalates, runs privileged commands (`sudo`/`pkexec`) or a package
     manager, or merely *displays* any of those for you to copy — the reason
     on the row says which. A capability held openly is not an accusation;
     most useful plugins live here.
