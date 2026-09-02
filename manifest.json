@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.weedwhitesandwine.plug",
   "name": "Plug",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "author": "weedwhitesandwine",
   "license": "MIT",
   "description": "Manage all your plugins, catch every update, and have AI scan the code BEFORE you update or install.",

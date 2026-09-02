@@ -382,10 +382,17 @@ PATTERN_ROWS = [
     # carry a flag first. `--user` is not an escalation — it needs no
     # privilege at all — so it goes to `install` below, which is where
     # persistence belongs.
+    #
+    # The power verbs are not privilege either: logind grants suspend and
+    # hibernate to any active local session through polkit, no root and no
+    # prompt, so `systemctl suspend` runs exactly as far as the user's own
+    # power button does. Counting it had Ripcord's row reading "runs commands
+    # as root" over code that cannot reach root at all. (The lookahead
+    # excludes by prefix, so `suspend` also covers `suspend-then-hibernate`.)
     ("privilege", "high", re.compile(
         r"\bsudo\b|\bpkexec\b|\bdoas\b|\bpolkit\b"
         r"|systemctl\s+(?:--(?!user\b)[\w-]+\s+)*"
-        r"(?!is-|status|show|list-|cat\b|help\b|--)[a-z]")),
+        r"(?!is-|status|show|list-|cat\b|help\b|suspend|hibernate|hybrid-sleep|--)[a-z]")),
     # Installing software, and arranging for something to keep running. This
     # is what a plugin's install-time script does, and none of the classes
     # above see it: a package manager is not a privileged word, `cmake
@@ -421,10 +428,17 @@ PATTERN_ROWS = [
 # itself, and here is how. Green is squeaky clean.
 TRUST_RED, TRUST_AMBER, TRUST_GREEN = "red", "amber", "green"
 
-# Things with no innocent explanation in a bar plugin when the code actually
-# runs them: reading somebody's keys, escalating, hiding what it does behind
-# an encoder, or driving a package manager while the shell is up.
+# Worth naming on the row whenever the code actually runs them: reading
+# somebody's keys, escalating, hiding what it does behind an encoder, or
+# driving a package manager while the shell is up.
 ALARMING = ("sensitive", "privilege", "obfuscation", "install")
+
+# The subset with no innocent explanation at all — virus-shaped, not merely
+# privileged. Running a command as root or a package manager is a capability
+# a legitimate plugin can hold and disclose (the marketplace lists several);
+# reading private keys or executing decoded blobs is not. Only these make a
+# plugin red, so red stays rare enough to mean "do not walk past this".
+HOSTILE = ("sensitive", "obfuscation")
 
 # Reaching off the machine is not alarming — most useful plugins do it — but
 # it is not squeaky clean either, and it is the difference between a plugin
@@ -463,14 +477,17 @@ def trust_band(hits, mentions, light, light_files):
     """Which of the three a plugin lands in, from what the scan found.
 
     `hits` is code that runs, `mentions` are strings it only displays, and
-    `light` is what a script you would run by hand does. The distinction is
-    the whole point: quoting `sudo systemctl enable` on screen for a user to
-    copy is a plugin being helpful, and running it is a plugin escalating."""
-    if any(c in hits for c in ALARMING):
+    `light` is what a script you would run by hand does. Run-versus-show still
+    decides the wording on the row, but only the HOSTILE subset decides red:
+    quoting `sudo systemctl enable` is a plugin being helpful, running it is a
+    plugin holding a capability worth naming, and reading `~/.ssh` is a plugin
+    nobody should install without reading."""
+    if any(c in hits for c in HOSTILE):
         return TRUST_RED
+    ran_alarm = any(c in hits for c in ALARMING)
     quoted_alarm = any(c in mentions or c in light for c in ALARMING)
     reaches = any(c in hits or c in mentions for c in REACHES_OUT)
-    if quoted_alarm or reaches or light_files:
+    if ran_alarm or quoted_alarm or reaches or light_files:
         return TRUST_AMBER
     return TRUST_GREEN
 
