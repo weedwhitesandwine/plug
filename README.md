@@ -28,9 +28,9 @@ English, whether it is safe.
   never a number:
   - ✅ **Green check — squeaky clean.** Nothing that leaves the machine, nothing
     alarming even mentioned, no install step. It keeps to itself.
-  - ❗ **Red exclamation — read it before installing.** Not a stop sign:
-    a warning that this needs your eyes. Code that Code that
-    *actually runs* one of: reading private files (`.ssh`, `id_rsa`, `.gnupg`,
+  - ❗ **Red exclamation — read it first.** Not a stop sign:
+    a warning that this needs your eyes. Code that *actually runs* one of:
+    reading private files (`.ssh`, `id_rsa`, `.gnupg`,
     keyring, `/etc/shadow`), or hiding itself behind an encoder (`atob`,
     `eval`, a packed line). No listed plugin is expected to be red. If it
     appears, read the code before anything else.
@@ -40,7 +40,7 @@ English, whether it is safe.
     on the row says which. A capability held openly is not an accusation;
     most useful plugins live here.
 
-  **The row always says which.** "reaches the network", "installs by hand",
+  **The row always says which.** "reaches the network", "has a setup script",
   "shows you commands as root" — a colour you cannot account for is worse than
   no colour, so the reason travels with it.
 

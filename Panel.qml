@@ -1854,14 +1854,14 @@ Item {
         Rectangle {
           visible: parent.band !== "green" && parent.band !== "red"
           anchors.fill: parent; radius: width / 2
-          color: parent.band === "amber" ? root.warnColor : root.fainter
+          color: root.trustColor(parent.band)
         }
         Text {
           visible: parent.band === "green" || parent.band === "red"
           anchors.centerIn: parent
           text: parent.band === "green" ? "✓" : "!"
           textFormat: Text.PlainText
-          color: parent.band === "green" ? root.okColor : root.dangerColor
+          color: root.trustColor(parent.band)
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           font.bold: true
@@ -1908,7 +1908,7 @@ Item {
               // line on the row, so it is what gives way. Red leads with the
               // ask — read it — because it is a warning, not a verdict.
               : rowData.trustBand === "red" && rowData.trustWhy
-                ? ("read it before installing — " + rowData.trustWhy)
+                ? ("read it — " + rowData.trustWhy)
               : rowData.trustWhy ? rowData.trustWhy
               : (rowData.id + (rowData.kinds ? " · " + rowData.kinds : ""))
           textFormat: Text.PlainText

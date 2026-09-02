@@ -389,6 +389,11 @@ PATTERN_ROWS = [
     # power button does. Counting it had Ripcord's row reading "runs commands
     # as root" over code that cannot reach root at all. (The lookahead
     # excludes by prefix, so `suspend` also covers `suspend-then-hibernate`.)
+    # logind grants reboot and poweroff to an active session too, and they
+    # stay flagged anyway, deliberately: they end every session on the
+    # machine, which is worth a word on the row even when no root is
+    # involved — the wording overclaims there and the disruption underwrites
+    # it. Suspend is recoverable; poweroff is not.
     ("privilege", "high", re.compile(
         r"\bsudo\b|\bpkexec\b|\bdoas\b|\bpolkit\b"
         r"|systemctl\s+(?:--(?!user\b)[\w-]+\s+)*"
@@ -452,7 +457,7 @@ CAP_SHORT = {"sensitive": "private files", "privilege": "commands as root",
              "fileWrite": "files"}
 
 
-def trust_why(hits, mentions, light, light_files):
+def trust_why(hits, mentions, light):
     """Why a plugin is not green, in a few words. A colour nobody can account
     for is the thing that made the old number useless, so the reason travels
     with the band and is never derived a second time at the panel."""
@@ -467,7 +472,7 @@ def trust_why(hits, mentions, light, light_files):
     # tests an install step had the row asserting a setup ritual the README
     # never asks for. Only a script that actually does setup-shaped things —
     # a package manager, privilege, persistence — earns the words.
-    if any(c in light for c in ALARMING):
+    if any(c in light for c in ALARMING + REACHES_OUT):
         why.append("has a setup script")
     # Only what the plugin displays. What a setup script does is already
     # said by "has a setup script", and calling it "shows you a package
@@ -478,7 +483,7 @@ def trust_why(hits, mentions, light, light_files):
     return " · ".join(why)
 
 
-def trust_band(hits, mentions, light, light_files):
+def trust_band(hits, mentions, light):
     """Which of the three a plugin lands in, from what the scan found.
 
     `hits` is code that runs, `mentions` are strings it only displays, and
@@ -492,10 +497,13 @@ def trust_band(hits, mentions, light, light_files):
     ran_alarm = any(c in hits for c in ALARMING)
     quoted_alarm = any(c in mentions or c in light for c in ALARMING)
     reaches = any(c in hits or c in mentions for c in REACHES_OUT)
-    # A shipped script bands by its contents (the `light` term above), never
-    # by existing: an unreferenced script with nothing alarming in it is a
-    # test harness, not an install step, and existence is not evidence.
-    if ran_alarm or quoted_alarm or reaches:
+    # A shipped script bands by its contents, never by existing: an
+    # unreferenced script with nothing alarming in it is a test harness, not
+    # an install step, and existence is not evidence. Its contents include
+    # the network — a setup step that downloads code is exactly the case the
+    # scan exists for — but not `process`, which every script would trip.
+    script_acts = any(c in light for c in ALARMING + REACHES_OUT)
+    if ran_alarm or quoted_alarm or reaches or script_acts:
         return TRUST_AMBER
     return TRUST_GREEN
 
@@ -760,8 +768,8 @@ def scan_plugin(dirpath, only_files=None, light_files=None):
                                "quotedOnly": is_mention,
                                "text": line.strip()[:200]})
     caps = sorted(set(hits) | set(mentions) | set(light))
-    return {"trustBand": trust_band(hits, mentions, light, light_files),
-            "trustWhy": trust_why(hits, mentions, light, light_files),
+    return {"trustBand": trust_band(hits, mentions, light),
+            "trustWhy": trust_why(hits, mentions, light),
             "capabilities": caps,
             "examples": examples,
             "counts": {c: len(hits[c]) for c in hits},
