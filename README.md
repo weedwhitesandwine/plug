@@ -125,10 +125,11 @@ tools you actually have:
 > servers, so Plug has to ask — and asking leaves your machine, which makes it
 > a button you press rather than something that happens around you.
 >
-> Opening **Settings** runs `which opencode`, exactly as it does for Claude,
-> Codex and Gemini, and reads your opencode configuration so the model you have
-> already chosen there is the one offered. Opencode then appears with a **Set
-> up Opencode** button describing what pressing it will do.
+> Plug builds its reviewer list when the shell loads it, and that is where
+> `which opencode` runs — exactly as it does for Claude, Codex and Gemini —
+> along with a read of your opencode configuration, so the model you have
+> already chosen there is the one offered. Opencode then appears in Settings
+> with a **Set up Opencode** button describing what pressing it will do.
 >
 > Pressing it runs `opencode models`, plus `opencode models <provider>` for
 > `anthropic`, `openai` and `google` every time, and for others such as
@@ -204,8 +205,11 @@ Its state is left in `~/.local/state/plug/`, which you can delete.
 **Its own state**, all inside `~/.local/state/plug/`: `state.json` (git and
 scan results per plugin), `catalog.json` (the marketplace catalog, cached),
 `settings.json` (your choices), `locks.json` (restore bookkeeping — which
-version each applied update came from), `opencode_models.json` (cached Opencode
-model list, written only when you press **Set up Opencode** / **Refresh models**).
+version each applied update came from), `review-<plugin-id>.json` (the last
+review of that plugin: the verdict, the summary, and the two commits it was
+read between, which is what the apply is checked against),
+`opencode_models.json` (cached Opencode model list, written only when you press
+**Set up Opencode** / **Refresh models**).
 
 **Outside its own directory** — only in response to something you do:
 
@@ -213,11 +217,11 @@ model list, written only when you press **Set up Opencode** / **Refresh models**
 |---|---|
 | `~/.config/hypr/bindings.lua` | only when you set or clear a hotkey, and only Plug's own marked block, between `-- >>> plug hotkey` and `-- <<< plug hotkey`, along with the blank line it writes above that block. Resolved the same way if it is a dotfiles symlink |
 | `~/.config/omarchy/shell.json` | only when you show or hide the bar icon. It adds, moves or removes its own `{"id": …}` entry and leaves every other setting as it found it, though the file is rewritten as standard JSON with two-space indentation. Where a dotfiles manager has symlinked this path into its own repository, the link is resolved and the real file written, so the link survives |
-| a plugin's own checkout under `~/.config/omarchy/plugins/…` | standard git operations (`fetch`, fast-forward, and `reset` for a revert) when you update or roll back **that** plugin |
-| `~/.config/opencode/opencode.json` / `opencode.jsonc` | whenever the reviewer list is built — which includes opening Settings — and again when you press **Set up Opencode** / **Refresh models**, to pick up the model you have configured in opencode so it is the one offered and used. A local read, capped at 64 KB, and the `jsonc` form may carry comments |
+| a plugin's own checkout under `~/.config/omarchy/plugins/…` | `git fetch` against every installed plugin's remote each time the panel opens (the update check, which you can turn off with `autoCheck`) and each time you press **Check for updates**; and, for the one plugin you act on, a fast-forward when you update it or a `reset` when you restore it |
+| `~/.config/opencode/opencode.json` / `opencode.jsonc` | when the reviewer list is built, which happens once as the shell loads Plug, and again when you press **Set up Opencode** / **Refresh models** — to pick up the model you have configured in opencode so it is the one offered and used. A local read, capped at 64 KB, and the `jsonc` form may carry comments |
 | `~/.local/share/opencode/auth.json` | only when you press **Set up Opencode** / **Refresh models**, read to see which providers you have set up so only those are probed. Capped at 64 KB, and only the names of the top-level entries are looked at |
 | `~/.local/state/plug/opencode_models.json` | written only when you press **Set up Opencode** / **Refresh models** (the cached model list, with `fetchedAt`); read back locally each time the reviewer list is built |
-| a temporary directory | a shallow clone of a plugin you asked Plug to check before installing, read and then deleted |
+| a temporary directory | two things, both read and then deleted: a shallow clone of a plugin you asked Plug to check before installing, and — when you review an update — a copy of the incoming version's files extracted from the plugin's own repository, so the reviewer reads the new code rather than only the diff |
 
 **Commands it runs:** `omarchy-shell shell listPlugins` / `listShellConfig` /
 `setPluginEnabled` (read the list and your shell config; enable/disable on your
@@ -235,8 +239,18 @@ plugin's repository page); and the AI reviewer you chose — either its command
 Only when you press **Set up Opencode** / **Refresh models** in Settings (and
 `opencode` is installed) does Plug run `opencode models` (+ `opencode models
 <provider>` for a few providers, see above) to discover models — without
-starting a review. Opening Settings itself only runs `which opencode`, like the
-other CLIs.
+starting a review.
+
+**What runs when the shell starts.** Plug builds its reviewer list once, as the
+shell loads it. That run does three things: `which` for each of `claude`,
+`codex`, `gemini` and `opencode`; a read of your opencode configuration, so the
+model you already chose there is the one offered; and an HTTP request to
+`localhost:11434` and `localhost:1234` to see whether Ollama or LM Studio is
+listening. Both requests go to the loopback interface and ask one question —
+whether a local server is there. `hyprctl binds` also runs at startup, to know
+which key combinations Hyprland has already taken. Everything the reviewer list
+needs is gathered in that one run, and it is the same list every time you open
+Settings afterwards.
 
 **Network:** each installed plugin's git remote, to check for and fetch updates;
 the repository of a store plugin you ask Plug to check before installing;

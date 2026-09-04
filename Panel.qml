@@ -177,8 +177,15 @@ Item {
     var a = root.lastApproved
     root.movedName = ""; root.movedSha = ""
     if (!a || !a.repo) return
-    root.runJob(["install", a.repo + ".git", a.name, a.sha, a.id,
-                 "--approved-version"], "Installing the version you approved…")
+    // Stripped before it is appended, exactly as the first install does. A
+    // catalog address never carries the suffix and a hand-typed one often
+    // does; this is the same address arriving back through the moved-version
+    // path, so without the strip an address typed with `.git` became
+    // `.git.git` and resolved nowhere — the bug its sibling call already
+    // documents, one line away.
+    root.runJob(["install", String(a.repo).replace(/\.git$/, "") + ".git",
+                 a.name, a.sha, a.id,
+                 "--approved-version"], "Installing the version you approved…", a.id)
   }
 
   // Settings, loaded from the engine's settings.json.
@@ -222,7 +229,7 @@ Item {
     root.cancelReview()
     root.noticeText = ""
     root.pendingHighlight = ""
-    root.busy = false; root.busyNote = ""
+    root.clearJob()
     if (!payloadJson || String(payloadJson) === "{}") {
       root.movedName = ""; root.movedSha = ""
     }
@@ -243,6 +250,15 @@ Item {
         jobPoll.restart()
       }
       if (payload.highlight) root.pendingHighlight = String(payload.highlight)
+      // A job says where it was started from, and the panel comes back there.
+      // Everything that reports through this door landed on the Installed tab
+      // regardless, so showing or hiding the bar icon — which can only be
+      // pressed in Settings — threw the user out of Settings on success. The
+      // panel reopening somewhere the user did not go is a small thing that
+      // reads as a bug every time.
+      if (payload.tab === "settings" || payload.tab === "store"
+          || payload.tab === "installed")
+        root.tab = String(payload.tab)
       if (payload.error && String(payload.error).indexOf("MOVED\t") === 0) {
         // Nothing was installed. The author pushed since the review, so the
         // choice is the user's: read the new version, or take the one they
@@ -295,11 +311,52 @@ Item {
   // The live installed list comes from the shell; the git/update/trust layer
   // comes from the engine's state.json. They are joined by id. First-party
   // plugins are dropped here and never appear again.
+  // A scan of a full plugin folder takes well over a second; the poll behind a
+  // finished job asks every 700ms. Restarting the process on each ask killed
+  // every scan before it could write its answer, so a job could poll for four
+  // seconds and re-read precisely nothing — the list went on showing the update
+  // it had just applied until the next upstream check rewrote the file some
+  // seconds later, with the button green for all of it.
+  //
+  // Skipping the ask instead is no better, only quieter: turning a plugin on or
+  // off asks exactly once, from a runner that carries no poll and no watchdog
+  // behind it, so the one ask that mattered could land inside a scan that had
+  // started BEFORE the toggle and be dropped — leaving the switch showing the
+  // position the user had just changed away from, with nothing due to ask
+  // again.
+  //
+  // So neither kill it nor drop it: remember it. A request arriving during a
+  // scan is served the moment that scan finishes, which is also the earliest
+  // moment it could have produced a fresh answer anyway.
+  //
+  // Both readers work this way, for the same reason and with different stakes.
+  // The plugin list is the shorter of the two, but it is where the on/off
+  // switch gets its position — so restarting it on every ask meant each poll
+  // killed the previous read and handed a truncated line to JSON.parse, which
+  // threw into an empty catch. Only the last read of a burst ever landed, and
+  // until it did, the switch showed the position the user had just changed
+  // away from. The symptom the scan comment describes, on the other reader.
+  property bool snapshotPending: false
+  property bool listPending: false
+
   function refreshAll() {
-    listProc.running = false
-    listProc.running = true
-    snapshotProc.running = false
-    snapshotProc.running = true
+    // Read the state file we already have before scanning for a new one.
+    //
+    // A row's on/off position is a join of two sources: the shell's own list,
+    // which answers in milliseconds, and this file, which the scan rewrites a
+    // second and a half later. The shell reports a plugin whose bar icon is
+    // hidden as disabled — it is enabled, it simply has no place in the bar —
+    // and the correction to that lives here, in `iconHidden`. Nothing read
+    // this file until the scan finished, so for the first second and a half
+    // of every open, the join ran with one half missing and every
+    // icon-hidden plugin was drawn as OFF, then flipped ON when the scan
+    // landed. This costs a file read of something already on disk, and it is
+    // the difference between the panel opening correct and opening wrong.
+    root.readState()
+    if (listProc.running) root.listPending = true
+    else { root.listPending = false; listProc.running = true }
+    if (snapshotProc.running) root.snapshotPending = true
+    else root.startSnapshot()
   }
 
   // Core shell infrastructure that is always on and has no meaningful switch,
@@ -388,7 +445,14 @@ Item {
 
   Process {
     id: listProc
-    command: ["omarchy-shell", "shell", "listPlugins"]
+    // Capped at the read like everything else. The shell is first-party and
+    // this has never been the risk, but a StdioCollector has no ceiling of its
+    // own, so an answer that grew unexpectedly would arrive whole inside a
+    // process that stays up for days. The house rule is that reads have a
+    // ceiling at the read, and a rule with an exception in it is a habit.
+    command: ["bash", "-c",
+              "omarchy-shell shell listPlugins | head -c " + root.stateCeiling]
+    onExited: if (root.listPending) { root.listPending = false; listProc.running = true }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -400,20 +464,106 @@ Item {
     }
   }
 
-  // snapshot writes state.json (offline, fast); we read it back through head.
+  // snapshot writes state.json; we read it back through head. It is offline,
+  // but it is not fast — well over a second across a full plugin folder.
   Process {
     id: snapshotProc
     command: ["python3", root.pluginDir + "/plugd.py", "snapshot"]
-    onExited: root.readState()
+    onExited: {
+      snapshotStall.stop()
+      root.snapshotKills = 0
+      root.readState()
+      // Somebody asked while this one was running. Serve it now.
+      if (root.snapshotPending) { root.snapshotPending = false; root.startSnapshot() }
+    }
     stdout: StdioCollector { waitForEnd: true }
   }
 
+  // Starting the scan and starting the clock on it are one action, so they are
+  // written as one. Arming the timer from `runningChanged` looked equivalent
+  // and was not: that signal is emitted when the child has actually started, so
+  // a python3 that hung on the way to exec — the stalled-mount case this timer
+  // exists for — never armed it at all, and the wait it was meant to bound had
+  // no end after all.
+  property int snapshotKills: 0
+  function startSnapshot() {
+    root.snapshotPending = false
+    // Each scan starts with a clean count. A process that fails to start emits
+    // no `exited` at all, so a count left over from one would have had the next
+    // genuinely-stuck scan killed outright on its first tick, with none of the
+    // grace this is supposed to begin with.
+    root.snapshotKills = 0
+    snapshotProc.running = true
+    snapshotStall.restart()
+  }
+
+  // Waiting on a scan is only safe if the wait can end. The engine allows each
+  // git call 25 seconds, and makes several per plugin, so a plugin folder on a
+  // stalled mount can hold this process for minutes — and a process that never
+  // exits would hold it for the life of the shell, with every later refresh
+  // waiting behind a scan that is never coming back. Nothing else in the panel
+  // would recover it: not closing and reopening, not the job watchdog. So the
+  // wait has its own end.
+  //
+  // The interval is set against the engine's own worst case rather than against
+  // a healthy scan. A scan makes up to six git calls per plugin, each allowed
+  // 25 seconds plus a 5 second wait, so one plugin on an unresponsive mount can
+  // legitimately occupy about three minutes. An interval below that kills scans
+  // that were merely slow — and a killed scan never reaches its write, so the
+  // panel goes on reading the old file believing it is current, which is the
+  // exact failure this whole area exists to prevent. Late is recoverable;
+  // wrong is not. It cannot tell slow from wedged, and when it cannot tell it
+  // waits.
+  //
+  // Sized for one such plugin, not for several. Two checkouts on the same dead
+  // mount legitimately need longer than this and would be cut off — accepted,
+  // because the alternative is an interval long enough that a genuinely wedged
+  // scan blocks every refresh for the better part of a quarter of an hour. A
+  // desktop with two plugins on a dead mount has a bigger problem than a stale
+  // switch position.
+  //
+  // It repeats because asking a process to stop is a request, not an outcome.
+  // The first ask is a SIGTERM; a process still there at the next tick is
+  // sent SIGKILL, which it cannot decline — except in uninterruptible I/O,
+  // where nothing would have helped and no signal is the answer.
+  //
+  // A refresh that arrived while the scan was running is deliberately NOT
+  // dropped here: it is newer than the scan being abandoned, so it is left
+  // standing for whichever exit finally lands.
+  Timer {
+    id: snapshotStall
+    interval: 240000
+    repeat: true
+    onTriggered: {
+      // A process that never started emits no exit, so nothing would ever stop
+      // this timer: it would tick against a null process for the life of the
+      // shell. Nothing running means nothing to wait for.
+      if (!snapshotProc.running) { snapshotStall.stop(); root.snapshotKills = 0; return }
+      root.snapshotKills += 1
+      if (root.snapshotKills <= 1) snapshotProc.running = false
+      else if (typeof snapshotProc.signal === "function") snapshotProc.signal(9)
+      else snapshotProc.running = false
+    }
+  }
+
   readonly property int stateCeiling: 4 * 1024 * 1024
-  function readState() { stateReader.running = false; stateReader.running = true }
+  // The third reader, coalesced like the other two. This one self-corrected —
+  // a killed read delivers its truncated buffer, JSON.parse throws, the catch
+  // swallows it and the restart brings the real answer — so it was left alone
+  // once. That is an argument for it being survivable, not for it being right:
+  // it still spends a process and swallows an exception every time two callers
+  // land together, and both `snapshotProc` and `checkProc` call it on exit.
+  // Three readers, one shape.
+  property bool statePending: false
+  function readState() {
+    if (stateReader.running) root.statePending = true
+    else { root.statePending = false; stateReader.running = true }
+  }
   Process {
     id: stateReader
     command: ["python3", "-c", root.safeRead,
               root.stateDir + "/state.json", String(root.stateCeiling)]
+    onExited: if (root.statePending) { root.statePending = false; stateReader.running = true }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -429,8 +579,16 @@ Item {
   }
 
   // The one network step behind the update flag.
+  // The footer line has more than one writer, and they finish in whatever
+  // order their processes do. A check started on open runs for as long as the
+  // network takes, so it routinely finishes in the middle of whatever the user
+  // did next — and both ends of it used to write the shared line
+  // unconditionally, so it announced itself over a job already in progress and
+  // then blanked that job's note on the way out. A job is the more important
+  // thing to be reporting and it is the one with an end the user is waiting
+  // for, so the check defers to it at both ends rather than fighting it.
   function checkUpdates() {
-    root.busy = true; root.busyNote = "Checking for updates…"
+    if (!root.jobRunning) { root.busy = true; root.busyNote = "Checking for updates…" }
     checkProc.running = false; checkProc.running = true
   }
   // Set once a network check has actually completed, so "no updates" is only
@@ -439,7 +597,10 @@ Item {
   Process {
     id: checkProc
     command: ["python3", root.pluginDir + "/plugd.py", "check-updates"]
-    onExited: { root.busy = false; root.busyNote = ""; root.updatesChecked = true; root.readState() }
+    onExited: {
+      if (!root.jobRunning) { root.busy = false; root.busyNote = "" }
+      root.updatesChecked = true; root.readState()
+    }
     stdout: StdioCollector { waitForEnd: true }
   }
 
@@ -453,8 +614,65 @@ Item {
   // plugin and still report nothing at all. So every one of them is handed to
   // plug-ctl.sh, detached: it outlives this window, finishes the job, and
   // summons Plug back with the result. That also covers Plug updating itself.
-  function runJob(args, note) {
+  // Which row a job is running on, and nothing else. It exists to take the
+  // press away while work is already in flight — the controls are reading a
+  // state file written before the job started, so acting on them acts on an
+  // answer that is already out of date. It deliberately carries no label,
+  // colour or wording: an earlier version of this described the job as well as
+  // guarding it, and the description was wrong in every case the guard was
+  // right about — "done" on a restore that had correctly become updatable
+  // again, a reload notice on the one job that does not reload. Guarding and
+  // narrating are separate problems; this is the guard.
+  property string jobId: ""
+
+  // And it guards every row, not the one it names.
+  //
+  // Guarding only the row a job was running on looked obviously right and was
+  // wrong, because the things being guarded are shared. There is one
+  // `toggleProc` for the whole list, one `busyNote`, one `jobId`. Pressing a
+  // second row's switch while the first was still working did not start a
+  // second job — it swapped the command out from under the running one and
+  // overwrote the id, so the first run's failure was reported against the
+  // second plugin's name, and the second command then started with no guard,
+  // no watchdog and nothing left to report it against.
+  //
+  // A job is a whole-panel condition. The panel says so.
+  //
+  // And where the work is a process this panel actually holds, the process
+  // itself is the authority — not a flag a timer can clear. Every previous
+  // version of this guard was released by something other than the work
+  // finishing: a poll running out of asks, a watchdog set below the job's own
+  // worst case, a summon arriving from an unrelated job and resetting the
+  // panel. Each of those released a guard while the runner was still moving
+  // state, and each reopened the same corridor — a second press swapping the
+  // command out from under a live run, so the first run's failure is reported
+  // against the second plugin's name and the second command runs unguarded.
+  // A running process cannot be argued with, so it is asked directly.
+  readonly property bool jobRunning: root.jobId !== "" || toggleProc.running
+
+  function clearJob() {
+    root.busy = false; root.busyNote = ""
+    root.jobId = ""
+    // The backstop exists to release the guard; releasing it here leaves the
+    // backstop with nothing to do but fire later and scan for no reason.
+    jobWatchdog.stop()
+  }
+
+  // Refused here rather than at each button, because the buttons were never
+  // the whole set. The row controls were guarded and the Store's install, the
+  // review's apply, the restore and the moved-version reinstall were not — so
+  // an install running from the Store could be joined by an apply from a
+  // review, each overwriting the other's id and re-arming the shared watchdog,
+  // and the first to report cleared the guard belonging to the second. This is
+  // the one door all of them go through. Anything added later gets the guard
+  // whether or not its author remembered to ask for one.
+  function runJob(args, note, id) {
+    if (root.jobRunning) {
+      root.noticeText = "Something is already running — wait for it to finish."
+      return
+    }
     root.busy = true; root.busyNote = note
+    root.jobId = id ? String(id) : ""
     jobWatchdog.restart()
     root.jobPollsLeft = 8
     jobPoll.restart()
@@ -477,6 +695,12 @@ Item {
       root.jobPollsLeft -= 1
       if (root.jobPollsLeft <= 0) {
         stop()
+        // The polling is over; the job is not necessarily. Running out of
+        // asks means the answer has not arrived yet, which is the worst
+        // possible moment to re-arm the row — the data behind those controls
+        // is still the data from before the job started. So the spinner goes
+        // and the guard stays, until the watchdog decides the runner is never
+        // reporting, or the summon that ends the job clears it properly.
         root.busy = false; root.busyNote = ""
       }
     }
@@ -485,10 +709,34 @@ Item {
   // follows clears it. A job that does not — toggling a plugin with no window
   // of its own — leaves the panel standing, so the wait cannot be left to hang
   // on a runner that died without reporting.
+  //
+  // Sized above the slowest job rather than above a typical one. Twenty
+  // seconds was under the worst case of nearly everything here: an install
+  // clones a repository over the network with no timeout of its own, and the
+  // still-at check alone can spend twenty-five. So the guard was routinely
+  // released while the job was still moving state — every row re-arming
+  // against pre-job data, and a second job free to start while the first was
+  // still writing shell.json and the plugins directory. That is the corridor
+  // the guard exists to close, opened by the guard's own backstop.
+  //
+  // Being generous costs little, because this is not the only way out: a job
+  // that finishes summons the panel and `open()` clears the guard, and a user
+  // who closes and reopens the panel clears it too. The timer is the last
+  // resort for a runner that dies silently, and a last resort should not fire
+  // while the thing it is watching is still working.
   Timer {
     id: jobWatchdog
-    interval: 20000
-    onTriggered: { root.busy = false; root.busyNote = ""; root.refreshAll() }
+    interval: 180000
+    onTriggered: {
+      // The attached runner is bounded by this too. `jobRunning` reads that
+      // process precisely so a timer cannot release the guard out from under
+      // live work — which means a runner that hangs would hold every control
+      // in the panel refused for the life of the shell, with `open()` unable
+      // to help because it clears the flag and not the process. Whatever this
+      // timer is willing to stop believing in, it has to be willing to stop.
+      toggleProc.running = false
+      root.clearJob(); root.refreshAll()
+    }
   }
 
   // Switching a plugin on or off tears nothing down — unlike installing,
@@ -514,16 +762,33 @@ Item {
   }
 
   function setEnabled(id, on) {
+    // Refuse while any job is running, not just one on this row. `toggleProc`
+    // is a single process shared by every row: a second call swaps its command
+    // and its id, so the run in flight finishes and reports itself under the
+    // new row's name, and the new command then starts unguarded. A control is
+    // not where a guard belongs anyway — the keyboard arrives here too, and so
+    // will anything added later.
+    if (root.jobRunning) return
     if (root.ownsAPanel(id)) {
-      root.runJob([on ? "enable" : "disable", id], (on ? "Enabling" : "Disabling") + "…")
+      root.runJob([on ? "enable" : "disable", id], (on ? "Enabling" : "Disabling") + "…", id)
       return
     }
     root.busy = true
     root.busyNote = (on ? "Enabling" : "Disabling") + "…"
     root.togglingId = id
+    // The same flag the detached jobs raise. This runner is attached and keeps
+    // the panel standing, so its row is on screen for the whole run and needs
+    // the guard more than they do, not less.
+    //
+    // The watchdog is a backstop for the note and the id, not for the guard:
+    // this job's own worst case is a shell answering slowly through up to
+    // seventeen bounded IPC calls, which outlasts twenty seconds, so the
+    // watchdog can and does fire mid-run. All it costs is the footer note —
+    // `jobRunning` reads the process, which is still there.
+    root.jobId = id
+    jobWatchdog.restart()
     toggleProc.command = ["bash", root.pluginDir + "/plug-ctl.sh",
                           on ? "enable" : "disable", id, "--attached"]
-    toggleProc.running = false
     toggleProc.running = true
   }
 
@@ -532,13 +797,23 @@ Item {
     id: toggleProc
     stderr: StdioCollector { id: toggleErr; waitForEnd: true }
     onExited: function(code) {
-      root.busy = false; root.busyNote = ""
+      root.clearJob()
       var err = (toggleErr.text || "").trim().split("\n").pop()
       root.noticeText = code === 0
         ? "" : ("Could not switch " + root.togglingId + (err ? " — " + err : ""))
       root.pendingHighlight = root.togglingId
       root.togglingId = ""
-      // Read what actually happened, now that it has finished happening.
+      // Read what actually happened, now that it has finished happening — and
+      // then ask again a few times. Disabling verifies through the shell's
+      // config, which is not the same thing the switch reads: the switch reads
+      // `listPlugins`, whose enabled flag can lag the config it was derived
+      // from. This path used to get the summon's six retries for free and now
+      // does not, so it asks for its own; each is cheap and they stop on their
+      // own. Enabling needs it less — plug-ctl confirms that one through
+      // `listPlugins` itself — but the cost of asking twice more is nothing
+      // against a switch left showing the position the user just left.
+      root.jobPollsLeft = 4
+      jobPoll.restart()
       root.refreshAll()
     }
   }
@@ -547,13 +822,17 @@ Item {
   function askRemove(id) { root.confirmRemoveId = id }
   function removeConfirmed(id) {
     root.confirmRemoveId = ""
-    root.runJob(["remove", id], "Removing…")
+    root.runJob(["remove", id], "Removing…", id)
   }
 
   // ------------------------------------------------------------------ update
   // The review gate. Running review invokes the chosen AI agent read-only on
   // the diff; when it lands we read review-<id>.json and show the verdict.
   function startReview(id) {
+    // A new read starts with no cancellation outstanding. The flag says "the
+    // answer about to arrive is the wreckage of something you stopped"; left
+    // set, it made the NEXT unreadable answer disappear silently instead.
+    root.reviewCancelled = 0
     root.reviewMode = "update"
     root.installCandidate = null
     root.reviewId = id
@@ -576,7 +855,13 @@ Item {
             root.noticeText = "Review failed: " + d.error
             root.cancelReview()
           }
-        } catch (e) {}
+        } catch (e) {
+          // Same rule as the other reader: a read the user stopped is not a
+          // read that failed, and the flag is consumed here either way rather
+          // than left standing to swallow the next real one.
+          if (root.reviewCancelled > 0) root.reviewCancelled -= 1
+          else root.noticeText = "Could not read the review result"
+        }
       }
     }
     stderr: StdioCollector { waitForEnd: true }
@@ -605,24 +890,44 @@ Item {
         var args = ["install", String(repo).replace(/\.git$/, "") + ".git",
                     nm, sha, pid]
         if (approvedVersion === true) args.push("--approved-version")
-        root.runJob(args, "Installing " + nm + "…")
+        root.runJob(args, "Installing " + nm + "…", pid)
       }
       return
     }
     var id = root.reviewId
     root.reviewId = ""; root.reviewData = null
-    root.runJob(["apply", id], "Applying update…")
+    root.runJob(["apply", id], "Applying update…", id)
   }
 
   function cancelReview() {
     root.reviewId = ""; root.reviewData = null; root.reviewRunning = false
     root.reviewMode = "update"; root.installCandidate = null
+    // Stop the work, not just the screen showing it. Backing out of a review
+    // cleared the panel's state and left the engine running: a clone bounded
+    // at 64 MB on disk is still 64 MB of text to walk character by character,
+    // and a repository built to be slow to scan could hold a core busy behind
+    // a panel the user had already closed, with nothing able to end it. Escape
+    // should mean escape.
+    //
+    // The engine takes the stop as an ordinary exit and deletes its clone on
+    // the way out. What it cannot do is finish the sentence it was writing, so
+    // the collector delivers a partial answer a moment later — expected here,
+    // and not an error to report.
+    // Counted, not flagged. Cancelling while both an inspect and a review were
+    // running set one boolean, the first collector to report consumed it, and
+    // the second then announced a failure for something the user had stopped.
+    if (inspectProc.running) root.reviewCancelled += 1
+    if (reviewProc.running) root.reviewCancelled += 1
+    inspectProc.running = false
+    reviewProc.running = false
   }
+  // How many stopped engine processes are still owed an unreadable answer.
+  property int reviewCancelled: 0
 
   // Undo the last applied update — the version to return to was recorded when
   // the update was applied.
   function revert(id) {
-    root.runJob(["rollback", id], "Restoring…")
+    root.runJob(["rollback", id], "Restoring…", id)
   }
 
   // ------------------------------------------------------------------ store
@@ -656,7 +961,9 @@ Item {
     // The shared busy flag drives the footer for things you pressed. A
     // refresh happening behind the rows you are already reading must not
     // borrow it, or Plug looks like it has hung on something you asked for.
-    if (!root.catalogQuiet) { root.busy = true; root.busyNote = "Fetching catalog…" }
+    // A job in flight owns the line for the same reason a quiet refresh does
+    // not take it: it is the thing the user is waiting on.
+    if (!root.catalogQuiet && !root.jobRunning) { root.busy = true; root.busyNote = "Fetching catalog…" }
     catalogFetch.running = false; catalogFetch.running = true
   }
   // Opening the Store: fetch if there is nothing to show, otherwise refresh
@@ -671,7 +978,7 @@ Item {
     command: ["python3", root.pluginDir + "/plugd.py", "catalog"]
     onExited: {
       root.catalogRefreshing = false
-      root.busy = false; root.busyNote = ""
+      if (!root.jobRunning) { root.busy = false; root.busyNote = "" }
       // The engine writes the saved copy only on success, so a failed fetch
       // leaves the Store working on what it already had. Say that, rather
       // than leaving a stale list looking current.
@@ -679,10 +986,13 @@ Item {
       // with three different answers, and the engine already knows which one
       // it hit. Flattening them into one line about the network sends you
       // looking in the wrong place.
-      var ok = false, why = ""
+      var ok = false, why = "", trimmed = false
       try {
         var d = JSON.parse(catalogFetchOut.text)
         ok = d.ok === true
+        // From THIS fetch's own answer, not from the flag left by the last
+        // file that was read back.
+        trimmed = d.truncated === true
         if (!ok && typeof d.error === "string")
           why = d.error.replace(/\s+/g, " ").trim().slice(0, 160)
       } catch (e) {}
@@ -692,6 +1002,12 @@ Item {
         root.noticeText = "Catalog not updated: "
           + (why === "" ? "no reason given" : why)
           + (root.catalogLoaded ? " — showing the saved copy" : "")
+      // A trimmed list is a fact about what you are looking at, not a progress
+      // message, so it is said even on a background refresh that otherwise
+      // keeps quiet — the whole point of `catalogQuiet` is to avoid announcing
+      // work nobody asked for, and "some of this list is missing" is not that.
+      else if (trimmed)
+        root.noticeText = "Catalog updated — too large to show in full, so the end of the list was left out"
       else if (!root.catalogQuiet) root.noticeText = "Catalog updated"
       root.loadCatalog()
     }
@@ -769,6 +1085,7 @@ Item {
     return q.length > 0 && q.length <= 300 && root.repoUrlPattern.test(q)
   }
   function checkUrl(u) {
+    root.reviewCancelled = 0
     var url = String(u || "").trim().replace(/\/+$/, "")
     if (url.length > 300 || !root.repoUrlPattern.test(url)) {
       root.noticeText = "That is not a repository address Plug can read"
@@ -788,15 +1105,58 @@ Item {
   // The commands that finish a manual install, for the clipboard. Built from
   // the plugin's own id and the script the scan actually found, so it is the
   // real path rather than a worked example.
+  // The commands are pinned to the commit that was reviewed, and they do not
+  // switch the plugin on.
+  //
+  // What this card used to hand over was `omarchy plugin add <url> --enable`,
+  // immediately below a review of one exact commit — an address, not a
+  // version, installed and switched on at whatever HEAD happened to be when
+  // the user got round to pasting it. Every other install path here spends
+  // real effort on that binding: it checks the repository is still at the
+  // reviewed commit, adds it disabled, moves the checkout to that exact sha,
+  // confirms it landed, and only then switches it on. This path skipped all of
+  // it — so the installs that also run a setup script, the riskiest ones,
+  // carried the weakest guarantee in the plugin. It is the same class of gap
+  // that blocked Plug at the marketplace before.
+  //
+  // Plug will not run the script for you, and that does not stop it handing
+  // over commands that keep the promise the review made.
   function manualCommands(d) {
     if (!d) return ""
     var repo = String(d.url || "")
-    var lines = ["omarchy plugin add " + repo + " --enable"]
+    var id = String(d.id || "<plugin-id>")
+    var sha = d && d.sha ? String(d.sha) : ""
+    var dir = "~/.config/omarchy/plugins/" + id
+    var lines = ["omarchy plugin add " + repo]
+    if (sha !== "")
+      lines.push("git -C " + dir + " checkout --quiet " + sha)
+    var notes = []
     var scripts = (d.manualInstall && d.manualInstall.scripts) || []
-    for (var i = 0; i < scripts.length; i++)
-      lines.push("~/.config/omarchy/plugins/" + String(d.id || "<plugin-id>")
-                 + "/" + String(scripts[i].file))
-    return lines.join("\n")
+    for (var i = 0; i < scripts.length; i++) {
+      // A name Plug will not put on a command line still gets said out loud.
+      // Dropping it would let the plugin choose whether its own install step
+      // was mentioned; printing it would hand over a command substitution.
+      // Neither — so it is described instead, and the user opens the folder.
+      if (scripts[i].safeName === false)
+        notes.push("# one script cannot be named safely on a command line — "
+                   + "open " + dir + " and run it yourself after reading it")
+      else
+        lines.push(dir + "/" + String(scripts[i].file))
+    }
+    // Last, and separate: switching it on is what starts the plugin running,
+    // and that belongs after the script the plugin said it needed, not before.
+    lines.push("omarchy plugin enable " + id)
+    // One command, not a list of them — which is what makes the pin binding.
+    //
+    // Joined with newlines, these were four independent commands: a terminal
+    // runs each one whatever the one above it did, so a `git checkout` that
+    // failed — the repository force-pushed past the reviewed commit, the add
+    // itself failed — printed its error and the paste carried on, running the
+    // install script and enabling the plugin at a version nobody reviewed.
+    // The `&&` was there and bound only to an `echo`. Chained, the first
+    // failure stops everything after it, which is the behaviour the comment
+    // claimed all along.
+    return lines.join(" &&\n") + (notes.length ? "\n" + notes.join("\n") : "")
   }
   function copyText(s) {
     if (!s) return
@@ -809,6 +1169,7 @@ Item {
   // the clone — nothing is installed and nothing in it is ever run.
   function installFromStore(c) {
     if (!c || !c.repo) return
+    root.reviewCancelled = 0
     root.reviewMode = "install"
     root.installCandidate = c
     root.reviewId = c.id || c.name || "plugin"
@@ -830,7 +1191,12 @@ Item {
             root.cancelReview()
           }
         } catch (e) {
-          root.noticeText = "Could not read the check result"
+          // A check the user backed out of is not a check that failed. Killing
+          // the engine makes its collector deliver whatever had arrived, which
+          // does not parse — so cancelling put "could not read the result" in
+          // the footer every time, blaming the tool for obeying.
+          if (root.reviewCancelled > 0) root.reviewCancelled -= 1
+          else root.noticeText = "Could not read the check result"
           root.cancelReview()
         }
       }
@@ -1002,6 +1368,16 @@ Item {
       root.captureNote = combo + " is already used by something else — try another."
       return
     }
+    // The shape check, actually run. `validShortcut` existed and was called
+    // from nowhere, so the two independent checks this value is supposed to
+    // pass through were one: the panel built a combination out of fixed parts
+    // and trusted itself, and only the control script ever tested the result.
+    // A guard defined and not called is worse than no guard, because the next
+    // person reads the definition and believes it.
+    if (!root.validShortcut(combo)) {
+      root.captureNote = "That is not a combination Plug can bind — try another."
+      return
+    }
     var s = JSON.parse(JSON.stringify(root.settings)); s.shortcut = combo
     root.settings = s; root.saveSettings()
     root.capturing = false; root.captureNote = ""
@@ -1102,12 +1478,26 @@ Item {
           }
           if (root.selectedIndex >= 0 && root.selectedIndex < n) {
             var row = root.installedRows[root.selectedIndex]
+            // The same guard the controls carry, for a job started in this
+            // session and still running.
+            //
+            // It does NOT cover the press this comment used to claim it did.
+            // A job that reloads the shell summons Plug back into a fresh
+            // panel with the row it acted on highlighted, so the cursor is
+            // parked on exactly the row whose data is still pre-job — and
+            // `open()` has cleared the job state on the way in, so nothing
+            // here knows. That press is stopped in the engine instead, where
+            // `apply_update` refuses a commit it is already on; no panel state
+            // survives the reload, so no panel guard can.
+            var rowBusy = root.jobRunning
             if (e.key === Qt.Key_Return || e.key === Qt.Key_Enter) {
+              if (rowBusy) { e.accepted = true; return }
               if (row.updateAvailable) root.startReview(row.id)
               else root.setEnabled(row.id, !row.enabled)
               e.accepted = true; return
             }
             if (e.key === Qt.Key_X || e.key === Qt.Key_Delete) {
+              if (rowBusy) { e.accepted = true; return }
               if (root.confirmRemoveId === row.id) root.removeConfirmed(row.id)
               else root.askRemove(row.id)
               e.accepted = true; return
@@ -1126,6 +1516,16 @@ Item {
       radius: root.cornerRadius
       border.color: root.border
       border.width: Math.max(1, Style.space(1))
+
+      // The scrim behind this card closes the panel when it is clicked, which
+      // is what a click outside the card should do. But a Rectangle does not
+      // accept mouse events, so every click that landed on the card and missed
+      // a control fell straight through to the scrim and closed the panel —
+      // reading a review meant not touching it. This accepts those clicks and
+      // does nothing with them. It is declared first, so everything else in
+      // the card is above it and still gets its own clicks; it takes no wheel
+      // events, so the lists and the review still scroll.
+      MouseArea { anchors.fill: parent }
 
       Column {
         anchors.fill: parent
@@ -1205,7 +1605,7 @@ Item {
               // (also badged in the header) or an explicit all-clear.
               Text {
                 anchors.verticalCenter: parent.verticalCenter
-                visible: root.updatesChecked && !(root.busy && root.busyNote.indexOf("update") >= 0)
+                visible: root.updatesChecked && !checkProc.running
                 text: root.updateCount > 0
                     ? (root.updateCount + " update" + (root.updateCount === 1 ? "" : "s") + " available")
                     : "✓ No updates available"
@@ -1217,7 +1617,12 @@ Item {
               }
               Item { width: Style.space(1); height: 1 }
               PlugButton {
-                label: root.busy && root.busyNote.indexOf("update") >= 0 ? "Checking…" : "Check for updates"
+                // Also the process itself rather than the footer text. Matching
+                // on a substring of a human-readable note is a binding that
+                // breaks when someone rewords the note, and it broke here for
+                // a different reason first: the note is not raised at all while
+                // a job owns the footer.
+                label: checkProc.running ? "Checking…" : "Check for updates"
                 onPicked: root.checkUpdates()
               }
             }
@@ -1575,7 +1980,14 @@ Item {
               Text {
                 anchors.centerIn: parent
                 visible: !root.catalogLoaded
-                text: root.busy ? "Fetching catalog…" : "Catalog not loaded."
+                // Ask the fetch whether it is running, not the shared footer
+                // flag. The footer belongs to whatever the user is waiting on
+                // and is deliberately not raised while a job holds it, so
+                // reading it here made the Store announce "Catalog not loaded"
+                // over a fetch that was in progress — a flatly false statement
+                // produced by asking the wrong object a question it was never
+                // answering.
+                text: root.catalogRefreshing ? "Fetching catalog…" : "Catalog not loaded."
                 textFormat: Text.PlainText
                 color: root.dim
                 font.family: root.fontFamily
@@ -1626,7 +2038,10 @@ Item {
             textFormat: Text.PlainText
             color: root.accent
             font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            // The one thing on screen saying work is in flight should not be
+            // the smallest text in the panel.
+            font.pixelSize: Style.font.body
+            font.bold: true
           }
         }
       }
@@ -1737,6 +2152,11 @@ Item {
     // highlight on it, and Enter then acts on it. Official rows have no
     // cursor to move, so they do not pretend to be clickable.
     property bool selectable: false
+    // A job is running somewhere in the panel. Every control on every row is
+    // reading the state file as it was before that job started, and the runners
+    // behind them are shared, so none of them is safe to press until it lands —
+    // not just the ones on the row being worked on.
+    readonly property bool working: root.jobRunning
     signal rowClicked()
     height: Style.space(48)
     radius: root.cornerRadius
@@ -1770,7 +2190,7 @@ Item {
       // dim when the plugin is current. Pressing it opens the review.
       Rectangle {
         visible: !(rowData && rowData.official)
-        readonly property bool armed: rowData && rowData.updateAvailable === true
+        readonly property bool armed: !!(rowData && rowData.updateAvailable === true && !working)
         anchors.verticalCenter: parent.verticalCenter
         width: upLbl.implicitWidth + Style.space(14); height: Style.space(22)
         radius: height / 2
@@ -1784,7 +2204,7 @@ Item {
       // previous version recorded to go back to.
       Rectangle {
         visible: !(rowData && rowData.official)
-        readonly property bool armed: rowData && rowData.canRevert === true
+        readonly property bool armed: !!(rowData && rowData.canRevert === true && !working)
         anchors.verticalCenter: parent.verticalCenter
         width: rsLbl.implicitWidth + Style.space(14); height: Style.space(22)
         radius: height / 2
@@ -1803,8 +2223,12 @@ Item {
         border.color: root.dangerColor; border.width: 1
         Text { id: rmLbl; anchors.centerIn: parent; text: confirming ? "sure?" : "remove"; textFormat: Text.PlainText; color: confirming ? "#1a1005" : root.dangerColor; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: confirming }
         MouseArea {
-          id: rmHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+          id: rmHover; anchors.fill: parent; hoverEnabled: true
+          cursorShape: working ? Qt.ArrowCursor : Qt.PointingHandCursor
+          // Removing a plugin out from under a job already running on it is
+          // the one press here with no way back.
           onClicked: {
+            if (working) return
             if (root.confirmRemoveId === rowData.id) root.removeConfirmed(rowData.id)
             else root.askRemove(rowData.id)
           }
@@ -1823,13 +2247,13 @@ Item {
             width: parent.width / 2; height: parent.height; radius: height / 2
             color: rowData && rowData.enabled ? root.okColor : "transparent"
             Text { anchors.centerIn: parent; text: "on"; textFormat: Text.PlainText; color: rowData && rowData.enabled ? "#0a1a0e" : root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (rowData && !rowData.enabled) root.setEnabled(rowData.id, true) }
+            MouseArea { anchors.fill: parent; cursorShape: working ? Qt.ArrowCursor : Qt.PointingHandCursor; onClicked: if (!working && rowData && !rowData.enabled) root.setEnabled(rowData.id, true) }
           }
           Rectangle {
             width: parent.width / 2; height: parent.height; radius: height / 2
             color: rowData && !rowData.enabled ? root.fainter : "transparent"
             Text { anchors.centerIn: parent; text: "off"; textFormat: Text.PlainText; color: rowData && !rowData.enabled ? root.foreground : root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (rowData && rowData.enabled && rowData.canDisable) root.setEnabled(rowData.id, false) }
+            MouseArea { anchors.fill: parent; cursorShape: working ? Qt.ArrowCursor : Qt.PointingHandCursor; onClicked: if (!working && rowData && rowData.enabled && rowData.canDisable) root.setEnabled(rowData.id, false) }
           }
         }
       }
@@ -2006,321 +2430,379 @@ Item {
   }
 
   component ReviewView: Item {
-    Column {
-      anchors.fill: parent
-      spacing: Style.space(12)
-      Row {
-        width: parent.width
-        spacing: Style.space(10)
-        PlugButton { label: "‹ back"; onPicked: root.cancelReview() }
-        Text {
-          anchors.verticalCenter: parent.verticalCenter
-          text: (root.reviewMode === "install" ? "Before installing: " : "Review: ")
-                + (root.reviewMode === "install" && root.installCandidate
-                   ? root.installCandidate.name : root.reviewId)
-          textFormat: Text.PlainText
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-          elide: Text.ElideRight
-          width: card.width - Style.space(140)
-        }
-      }
+    id: reviewView
 
-      // running spinner-ish
-      Item {
-        visible: root.reviewRunning
-        width: parent.width; height: Style.space(80)
-        Text {
-          anchors.centerIn: parent
-          text: {
-            var what = root.reviewMode === "install"
-              ? "the plugin's code" : "the changes"
-            if (root.reviewMode === "install" && !root.reviewData)
-              return root.settings.reviewAgent === "none"
-                ? "Fetching a copy and scanning it…"
-                : "Fetching a copy and asking " + root.settings.reviewAgent + " to read it…"
-            return root.settings.reviewAgent === "none" ? "Scanning " + what + "…"
-                 : "Asking " + root.settings.reviewAgent + " to read " + what + "…"
-          }
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-        }
+    // The header and the buttons are pinned to the top and the bottom of
+    // the card; only the body between them scrolls. In a plain Column a
+    // long review pushed the buttons off the bottom with nothing to scroll
+    // and no way to reach them, so a verdict could be read and the update
+    // it approved could not be applied.
+    Row {
+      id: reviewHeader
+      anchors.top: parent.top
+      anchors.left: parent.left
+      anchors.right: parent.right
+      spacing: Style.space(10)
+      PlugButton { label: "‹ back"; onPicked: root.cancelReview() }
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        text: (root.reviewMode === "install" ? "Before installing: " : "Review: ")
+              + (root.reviewMode === "install" && root.installCandidate
+                 ? root.installCandidate.name : root.reviewId)
+        textFormat: Text.PlainText
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        elide: Text.ElideRight
+        width: card.width - Style.space(140)
       }
+    }
 
-      // verdict
+    Flickable {
+      id: reviewScroll
+      anchors.top: reviewHeader.bottom
+      anchors.topMargin: Style.space(12)
+      anchors.bottom: reviewActions.top
+      anchors.bottomMargin: Style.space(12)
+      anchors.left: parent.left
+      anchors.right: parent.right
+      contentHeight: reviewBody.height
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
       Column {
-        visible: !root.reviewRunning && root.reviewData !== null
-        width: parent.width
-        spacing: Style.space(10)
-        Rectangle {
+        id: reviewBody
+        width: reviewScroll.width
+        spacing: Style.space(12)
+        // running spinner-ish
+        Item {
+          visible: root.reviewRunning
+          width: parent.width; height: Style.space(80)
+          Text {
+            anchors.centerIn: parent
+            text: {
+              var what = root.reviewMode === "install"
+                ? "the plugin's code" : "the changes"
+              if (root.reviewMode === "install" && !root.reviewData)
+                return root.settings.reviewAgent === "none"
+                  ? "Fetching a copy and scanning it…"
+                  : "Fetching a copy and asking " + root.settings.reviewAgent + " to read it…"
+              return root.settings.reviewAgent === "none" ? "Scanning " + what + "…"
+                   : "Asking " + root.settings.reviewAgent + " to read " + what + "…"
+            }
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+        }
+
+        // verdict
+        Column {
+          visible: !root.reviewRunning && root.reviewData !== null
           width: parent.width
-          height: verdictCol.height + Style.space(24)
-          radius: root.cornerRadius
-          color: {
-            var v = root.reviewData ? root.reviewData.review.verdict : "UNKNOWN"
-            var c = root.verdictColor(v)
-            return Qt.rgba(c.r, c.g, c.b, 0.12)
-          }
-          border.width: 1
-          border.color: {
-            var v = root.reviewData ? root.reviewData.review.verdict : "UNKNOWN"
-            return root.verdictColor(v)
-          }
-          Column {
-            id: verdictCol
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: Style.space(12)
-            spacing: Style.space(6)
-            Row {
-              spacing: Style.space(10)
-              Rectangle {
-                width: Style.space(16); height: Style.space(16); radius: width / 2
-                anchors.verticalCenter: parent.verticalCenter
-                color: root.reviewData ? root.verdictColor(root.reviewData.review.verdict) : root.fainter
+          spacing: Style.space(10)
+          Rectangle {
+            width: parent.width
+            height: verdictCol.height + Style.space(24)
+            radius: root.cornerRadius
+            color: {
+              var v = root.reviewData ? root.reviewData.review.verdict : "UNKNOWN"
+              var c = root.verdictColor(v)
+              return Qt.rgba(c.r, c.g, c.b, 0.12)
+            }
+            border.width: 1
+            border.color: {
+              var v = root.reviewData ? root.reviewData.review.verdict : "UNKNOWN"
+              return root.verdictColor(v)
+            }
+            Column {
+              id: verdictCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.margins: Style.space(12)
+              spacing: Style.space(6)
+              Row {
+                spacing: Style.space(10)
+                Rectangle {
+                  width: Style.space(16); height: Style.space(16); radius: width / 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  color: root.reviewData ? root.verdictColor(root.reviewData.review.verdict) : root.fainter
+                }
+                Text {
+                  text: {
+                    if (!root.reviewData) return ""
+                    var v = root.reviewData.review.verdict
+                    return v === "SAFE" ? "Safe to update"
+                         : v === "CAUTION" ? "Be careful"
+                         : v === "DANGER" ? "Do not update" : "Unclear"
+                  }
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.subtitle
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                  visible: root.reviewData && root.reviewData.review.agent && root.reviewData.review.agent !== "none"
+                  text: root.reviewData ? "reviewed by " + root.reviewData.review.agent : ""
+                  textFormat: Text.PlainText
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
               }
               Text {
-                text: {
-                  if (!root.reviewData) return ""
-                  var v = root.reviewData.review.verdict
-                  return v === "SAFE" ? "Safe to update"
-                       : v === "CAUTION" ? "Be careful"
-                       : v === "DANGER" ? "Do not update" : "Unclear"
-                }
+                width: parent.width
+                text: root.reviewData ? root.reviewData.review.headline : ""
                 textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
                 color: root.foreground
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.subtitle
-                font.bold: true
-                anchors.verticalCenter: parent.verticalCenter
+                font.pixelSize: Style.font.body
               }
-              Text {
-                visible: root.reviewData && root.reviewData.review.agent && root.reviewData.review.agent !== "none"
-                text: root.reviewData ? "reviewed by " + root.reviewData.review.agent : ""
+            }
+          }
+
+          Text {
+            text: "What changed"
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            Repeater {
+              model: root.reviewData ? root.reviewData.review.whatChanged : []
+              delegate: Text {
+                width: card.width - Style.space(60)
+                text: "•  " + modelData
                 textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+            }
+          }
+          Text {
+            visible: root.reviewData && root.reviewData.review.watchFor && root.reviewData.review.watchFor !== "nothing notable"
+            width: card.width - Style.space(60)
+            text: root.reviewData ? "⚠  " + root.reviewData.review.watchFor : ""
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: root.warnColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          // The author's own words for the change, next to the AI's read.
+          //
+          // Coerced to a real boolean, because there is no changelog on an
+          // install: `reviewData.changelog` is then undefined, the whole
+          // expression evaluates to undefined rather than false, and assigning
+          // that to `visible` left the heading on screen with nothing under it.
+          // It read as a plugin whose author had written release notes that
+          // Plug had failed to fetch.
+          Text {
+            visible: !!(root.reviewData && root.reviewData.changelog
+                        && root.reviewData.changelog.length > 0)
+            text: "The author's notes"
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+          Column {
+            visible: !!(root.reviewData && root.reviewData.changelog
+                        && root.reviewData.changelog.length > 0)
+            width: parent.width
+            spacing: Style.space(2)
+            Repeater {
+              model: root.reviewData ? root.reviewData.changelog : []
+              delegate: Text {
+                width: card.width - Style.space(60)
+                text: "·  " + modelData
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
               }
             }
+          }
+
+          // A repository with no manifest is not a plugin, and `omarchy plugin
+          // add` would refuse it. Saying that is more use than a verdict on
+          // code that could never have been installed.
+          Text {
+            visible: root.reviewData && root.reviewData.isPlugin === false
+            width: card.width - Style.space(60)
+            text: "This repository has no manifest.json, so it is not an Omarchy "
+                + "plugin and cannot be installed as one. The review above is "
+                + "still a read of its code."
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: root.warnColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          // The install Plug will not do for you. Cloning a repository runs
+          // nothing in it, so a plugin needing packages, a build or a service
+          // ships a script and expects you to run it — and that script runs as
+          // you, immediately, before a line of the plugin's own code loads.
+          // Reviewing code and then executing it is the one thing this plugin
+          // exists not to do, so it reads the script, says what it would do,
+          // and hands the commands back.
+          Column {
+            id: manualBlock
+            readonly property var mi: root.reviewData ? root.reviewData.manualInstall : null
+            readonly property var scripts: mi && mi.scripts ? mi.scripts : []
+            // A review with no manualInstall key leaves this undefined rather
+            // than false, and QML refuses to assign undefined to a bool: the
+            // property keeps whatever it held last, so the block stayed on
+            // screen from a previous review. `!!` makes the miss a false.
+            visible: !!(mi && mi.required === true)
+            width: parent.width
+            spacing: Style.space(6)
+
             Text {
-              width: parent.width
-              text: root.reviewData ? root.reviewData.review.headline : ""
+              text: "Manual installation required"
               textFormat: Text.PlainText
-              wrapMode: Text.WordWrap
-              color: root.foreground
+              color: root.warnColor
               font.family: root.fontFamily
-              font.pixelSize: Style.font.body
+              font.pixelSize: Style.font.caption
+              font.bold: true
             }
-          }
-        }
-
-        Text {
-          text: "What changed"
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          font.bold: true
-        }
-        Column {
-          width: parent.width
-          spacing: Style.space(4)
-          Repeater {
-            model: root.reviewData ? root.reviewData.review.whatChanged : []
-            delegate: Text {
+            Text {
               width: card.width - Style.space(60)
-              text: "•  " + modelData
-              textFormat: Text.PlainText
-              wrapMode: Text.WordWrap
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-            }
-          }
-        }
-        Text {
-          visible: root.reviewData && root.reviewData.review.watchFor && root.reviewData.review.watchFor !== "nothing notable"
-          width: card.width - Style.space(60)
-          text: root.reviewData ? "⚠  " + root.reviewData.review.watchFor : ""
-          textFormat: Text.PlainText
-          wrapMode: Text.WordWrap
-          color: root.warnColor
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-
-        // The author's own words for the change, next to the AI's read.
-        //
-        // Coerced to a real boolean, because there is no changelog on an
-        // install: `reviewData.changelog` is then undefined, the whole
-        // expression evaluates to undefined rather than false, and assigning
-        // that to `visible` left the heading on screen with nothing under it.
-        // It read as a plugin whose author had written release notes that
-        // Plug had failed to fetch.
-        Text {
-          visible: !!(root.reviewData && root.reviewData.changelog
-                      && root.reviewData.changelog.length > 0)
-          text: "The author's notes"
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          font.bold: true
-        }
-        Column {
-          visible: !!(root.reviewData && root.reviewData.changelog
-                      && root.reviewData.changelog.length > 0)
-          width: parent.width
-          spacing: Style.space(2)
-          Repeater {
-            model: root.reviewData ? root.reviewData.changelog : []
-            delegate: Text {
-              width: card.width - Style.space(60)
-              text: "·  " + modelData
+              text: "Adding this plugin only copies its files. It ships a script "
+                  + "that finishes the install, which Plug will not run for you "
+                  + "— run it yourself once you have read what it does."
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
-          }
-        }
-
-        // A repository with no manifest is not a plugin, and `omarchy plugin
-        // add` would refuse it. Saying that is more use than a verdict on
-        // code that could never have been installed.
-        Text {
-          visible: root.reviewData && root.reviewData.isPlugin === false
-          width: card.width - Style.space(60)
-          text: "This repository has no manifest.json, so it is not an Omarchy "
-              + "plugin and cannot be installed as one. The review above is "
-              + "still a read of its code."
-          textFormat: Text.PlainText
-          wrapMode: Text.WordWrap
-          color: root.warnColor
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-
-        // The install Plug will not do for you. Cloning a repository runs
-        // nothing in it, so a plugin needing packages, a build or a service
-        // ships a script and expects you to run it — and that script runs as
-        // you, immediately, before a line of the plugin's own code loads.
-        // Reviewing code and then executing it is the one thing this plugin
-        // exists not to do, so it reads the script, says what it would do,
-        // and hands the commands back.
-        Column {
-          id: manualBlock
-          readonly property var mi: root.reviewData ? root.reviewData.manualInstall : null
-          readonly property var scripts: mi && mi.scripts ? mi.scripts : []
-          visible: mi && mi.required === true
-          width: parent.width
-          spacing: Style.space(6)
-
-          Text {
-            text: "Manual installation required"
-            textFormat: Text.PlainText
-            color: root.warnColor
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-          }
-          Text {
-            width: card.width - Style.space(60)
-            text: "Adding this plugin only copies its files. It ships a script "
-                + "that finishes the install, which Plug will not run for you "
-                + "— run it yourself once you have read what it does."
-            textFormat: Text.PlainText
-            wrapMode: Text.WordWrap
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-          Repeater {
-            model: manualBlock.scripts
-            delegate: Column {
-              width: card.width - Style.space(60)
-              spacing: Style.space(2)
-              Text {
-                text: modelData.file + "  ·  " + modelData.lines + " lines"
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-              Repeater {
-                model: modelData.steps || []
-                delegate: Text {
-                  width: card.width - Style.space(72)
-                  // Straight from the script, in the order it runs. Plain
-                  // text, like everything else that came out of a stranger's
-                  // repository.
-                  text: "    " + modelData.text
-                        + (modelData.quotedOnly ? "   (quoted, not run)" : "")
+            Repeater {
+              model: manualBlock.scripts
+              delegate: Column {
+                width: card.width - Style.space(60)
+                spacing: Style.space(2)
+                Text {
+                  text: modelData.file + "  ·  " + modelData.lines + " lines"
                   textFormat: Text.PlainText
-                  wrapMode: Text.WrapAnywhere
-                  color: root.dim
-                  font.family: root.monoFamily
+                  color: root.foreground
+                  font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+                Repeater {
+                  model: modelData.steps || []
+                  delegate: Text {
+                    width: card.width - Style.space(72)
+                    // Straight from the script, in the order it runs. Plain
+                    // text, like everything else that came out of a stranger's
+                    // repository.
+                    text: "    " + modelData.text
+                          + (modelData.quotedOnly ? "   (quoted, not run)" : "")
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAnywhere
+                    color: root.dim
+                    font.family: root.monoFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
             }
+            Text {
+              width: card.width - Style.space(60)
+              text: root.manualCommands(root.reviewData)
+              textFormat: Text.PlainText
+              wrapMode: Text.WrapAnywhere
+              color: root.foreground
+              font.family: root.monoFamily
+              font.pixelSize: Style.font.caption
+            }
           }
-          Text {
-            width: card.width - Style.space(60)
-            text: root.manualCommands(root.reviewData)
-            textFormat: Text.PlainText
-            wrapMode: Text.WrapAnywhere
-            color: root.foreground
-            font.family: root.monoFamily
-            font.pixelSize: Style.font.caption
-          }
-        }
-
-        Row {
-          spacing: Style.space(8)
-          readonly property bool manual: root.reviewData && root.reviewData.manualInstall
-                                         && root.reviewData.manualInstall.required === true
-          readonly property bool notAPlugin: root.reviewData
-                                             && root.reviewData.isPlugin === false
-          PlugButton {
-            readonly property bool refused: root.reviewData && root.reviewData.review
-                                            && root.reviewData.review.verdict === "DANGER"
-            // Plug installs what a clone alone completes. Where a script has
-            // to run afterwards, the honest button is the one that gives you
-            // the commands, not one that half-installs it and says nothing.
-            visible: !parent.manual && !parent.notAPlugin
-            label: root.reviewMode !== "install"
-                 ? (refused ? "Apply anyway" : "Apply update")
-                 : (refused ? "Install anyway" : "Install")
-            // The update path is the one people meet again and again, and a
-            // DANGER verdict there used to read "Apply update" in ordinary
-            // styling, with Enter applying it unremarked.
-            danger: refused
-            onPicked: root.approveUpdate()
-          }
-          PlugButton {
-            visible: parent.manual
-            label: "Copy the commands"
-            onPicked: root.copyText(root.manualCommands(root.reviewData))
-          }
-          PlugButton {
-            visible: parent.manual || parent.notAPlugin
-            label: "Open repository"
-            onPicked: root.openRepo({ repo: root.reviewData ? root.reviewData.url : "",
-                                      name: root.reviewData ? root.reviewData.name : "" })
-          }
-          PlugButton { label: root.reviewMode === "install" ? "Cancel" : "Not now"; onPicked: root.cancelReview() }
         }
       }
+    }
+
+    // A body that scrolls has to say so: unmarked, a review cut off at the
+    // fold reads as the whole review.
+    Rectangle {
+      anchors.right: reviewScroll.right
+      anchors.top: reviewScroll.top
+      width: Style.space(4)
+      height: reviewScroll.height
+      radius: width / 2
+      color: root.hairline
+      visible: reviewScroll.contentHeight > reviewScroll.height
+      Rectangle {
+        width: parent.width
+        radius: width / 2
+        color: root.dim
+        height: Math.max(Style.space(28),
+                         parent.height * reviewScroll.height
+                         / Math.max(1, reviewScroll.contentHeight))
+        y: (parent.height - height)
+           * (reviewScroll.contentY
+              / Math.max(1, reviewScroll.contentHeight - reviewScroll.height))
+      }
+    }
+
+    Row {
+      id: reviewActions
+      anchors.left: parent.left
+      anchors.bottom: parent.bottom
+      // The condition the enclosing Column used to carry: nothing to act on
+      // while the review is still running.
+      visible: !root.reviewRunning && root.reviewData !== null
+      spacing: Style.space(8)
+      // Same again: a missing key is undefined, not false, and these three
+      // bools decide which buttons the review offers.
+      readonly property bool manual: !!(root.reviewData && root.reviewData.manualInstall
+                                        && root.reviewData.manualInstall.required === true)
+      readonly property bool notAPlugin: !!(root.reviewData
+                                            && root.reviewData.isPlugin === false)
+      PlugButton {
+        readonly property bool refused: !!(root.reviewData && root.reviewData.review
+                                           && root.reviewData.review.verdict === "DANGER")
+        // Plug installs what a clone alone completes. Where a script has
+        // to run afterwards, the honest button is the one that gives you
+        // the commands, not one that half-installs it and says nothing.
+        visible: !parent.manual && !parent.notAPlugin
+        label: root.reviewMode !== "install"
+             ? (refused ? "Apply anyway" : "Apply update")
+             : (refused ? "Install anyway" : "Install")
+        // The update path is the one people meet again and again, and a
+        // DANGER verdict there used to read "Apply update" in ordinary
+        // styling, with Enter applying it unremarked.
+        danger: refused
+        onPicked: root.approveUpdate()
+      }
+      PlugButton {
+        visible: parent.manual
+        label: "Copy the commands"
+        onPicked: root.copyText(root.manualCommands(root.reviewData))
+      }
+      PlugButton {
+        visible: parent.manual || parent.notAPlugin
+        label: "Open repository"
+        onPicked: root.openRepo({ repo: root.reviewData ? root.reviewData.url : "",
+                                  name: root.reviewData ? root.reviewData.name : "" })
+      }
+      PlugButton { label: root.reviewMode === "install" ? "Cancel" : "Not now"; onPicked: root.cancelReview() }
     }
   }
 
@@ -2402,6 +2884,12 @@ Item {
           // no network until this is pressed. Result is cached to Plug's own
           // state; Refresh re-runs the same discovery.
           Column {
+            // Named, because the children below read these three properties.
+            // A binding in a child resolves an unqualified name against the
+            // child's own properties and then the file's root object — never
+            // the enclosing object — so `oc` and `hasCache` written bare threw
+            // a ReferenceError on every open and left every visible: unset.
+            id: opencodeBlock
             visible: root.settings.reviewAgent === "opencode"
             width: parent.width
             spacing: Style.space(6)
@@ -2426,19 +2914,20 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               text: {
+                var oc = opencodeBlock.oc
                 if (!oc) return "Opencode not installed — install the `opencode` command to use it."
-                if (hasCache) {
+                if (opencodeBlock.hasCache) {
                   var at = oc.cachedAt || ""
                   var when = at ? at.slice(0,19).replace("T"," ") : ""
                   return when ? "Models cached " + when + " — Refresh re-runs discovery." : "Models cached — Refresh re-runs discovery."
                 }
-                if (hasModels)
+                if (opencodeBlock.hasModels)
                   return "Offering the model you have configured in opencode. Set up to see the rest of what it can reach."
                 return "Opencode needs explicit setup before its model list appears. Nothing has run yet and nothing has left this machine."
               }
             }
             Text {
-              visible: !!(oc && !hasCache)
+              visible: !!(opencodeBlock.oc && !opencodeBlock.hasCache)
               width: card.width - Style.space(60)
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
@@ -2450,12 +2939,12 @@ Item {
             Row {
               spacing: Style.space(8)
               PlugButton {
-                visible: !!(oc && !hasCache)
+                visible: !!(opencodeBlock.oc && !opencodeBlock.hasCache)
                 label: root.opencodeDiscovering ? "asking opencode…" : "Set up Opencode — find available models"
                 onPicked: if (!root.opencodeDiscovering) root.discoverOpencode()
               }
               PlugButton {
-                visible: !!(oc && hasCache)
+                visible: !!(opencodeBlock.oc && opencodeBlock.hasCache)
                 label: root.opencodeDiscovering ? "Refreshing…" : "Refresh models"
                 onPicked: if (!root.opencodeDiscovering) root.discoverOpencode()
               }
@@ -2470,9 +2959,13 @@ Item {
               }
             }
             Text {
-              visible: !!(hasCache && oc && oc.models.length > 0)
+              visible: !!(opencodeBlock.hasCache && opencodeBlock.oc
+                          && opencodeBlock.oc.models.length > 0)
               width: card.width - Style.space(60)
-              text: oc ? oc.models.length + " models cached" + (oc.cachedAt ? " · " + oc.cachedAt.slice(0,10) : "") : ""
+              text: opencodeBlock.oc
+                  ? opencodeBlock.oc.models.length + " models cached"
+                    + (opencodeBlock.oc.cachedAt ? " · " + opencodeBlock.oc.cachedAt.slice(0,10) : "")
+                  : ""
               textFormat: Text.PlainText
               color: root.fainter
               font.family: root.fontFamily
@@ -2502,9 +2995,49 @@ Item {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
               }
-              MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { root.capturing = true; root.captureNote = "" } }
+              // Re-read what Hyprland has bound before listening for a key.
+              // The list was read once when the shell started and never again,
+              // so a combination bound since then was not known to be taken —
+              // and the whole point of the list is to explain why a key press
+              // never arrives. Stale, it explains nothing and the recorder
+              // looks broken instead.
+              MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { root.loadBinds(); root.capturing = true; root.captureNote = "" } }
             }
-            PlugButton { label: "clear"; onPicked: root.clearHotkey() }
+            // Only offered when there is something to clear — a Clear button
+            // beside "no hotkey set" is a button that does nothing.
+            PlugButton {
+              visible: (root.settings.shortcut || "") !== ""
+              label: "clear"
+              onPicked: root.clearHotkey()
+            }
+          }
+          // Where it went, and why Clear matters. Uninstalling a plugin runs
+          // nothing belonging to it, so the block Plug wrote into bindings.lua
+          // would outlive the plugin with nothing left able to remove it. The
+          // house standard says both lines belong on the card, not only in the
+          // README, and this card had neither.
+          Text {
+            visible: (root.settings.shortcut || "") !== ""
+            width: card.width - Style.space(60)
+            text: "Bound in a marked block in ~/.config/hypr/bindings.lua, between "
+                + "-- >>> plug hotkey and -- <<< plug hotkey. Every other line in "
+                + "that file is left as it was."
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            visible: (root.settings.shortcut || "") !== ""
+            width: card.width - Style.space(60)
+            text: "Press clear before uninstalling Plug — removing it deletes the "
+                + "script that would take the block out again."
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: root.warnColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
           Text {
             visible: root.captureNote !== ""

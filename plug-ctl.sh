@@ -121,7 +121,8 @@ DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # having changed nothing, so disable said "Disabled" while the plugin ran on,
 # and remove deleted the directory with the config still pointing at it.
 refs_left() {
-  omarchy-shell shell listShellConfig 2>/dev/null | python3 -c '
+  # head -c so the ceiling is at the read, matching every other read here.
+  omarchy-shell shell listShellConfig 2>/dev/null | head -c 4194304 | python3 -c '
 import json, sys
 want = sys.argv[1]
 try:
@@ -148,7 +149,7 @@ sys.exit(0 if want in seen else 1)' "$1"
 # list instead. Either location counts as on here: hiding an icon is not
 # switching a plugin off, and nothing should drag a hidden icon back.
 is_on() {
-  if omarchy-shell shell listPlugins 2>/dev/null | python3 -c '
+  if omarchy-shell shell listPlugins 2>/dev/null | head -c 4194304 | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -196,7 +197,8 @@ d = {}
 if h: d["highlight"] = h
 if e: d["error"] = e
 elif n: d["notice"] = n
-print(json.dumps(d))' "$highlight" "$notice" "$err")
+if len(sys.argv) > 4 and sys.argv[4]: d["tab"] = sys.argv[4]
+print(json.dumps(d))' "$highlight" "$notice" "$err" "${4:-}")
   for i in $(seq 1 60); do
     [[ $(omarchy-shell shell ping 2>/dev/null) ]] && break
     sleep 0.5
@@ -213,6 +215,18 @@ print(json.dumps(d))' "$highlight" "$notice" "$err")
 
 # The last line is what a failing command actually said; the rest is noise.
 last_line() { printf '%s' "$1" | tail -n 1; }
+
+# The same rule the engine applies to a plugin id, applied again here because
+# this is where the value becomes a path and an argument to `omarchy plugin
+# remove`. `local LC_ALL=C` so the character classes mean bytes rather than
+# whatever the user's locale is willing to call a letter — without it this
+# accepts `ábc` while the engine rejects it, and two guards that disagree are
+# one guard with a gap between them.
+valid_plugin_id() {
+  local LC_ALL=C
+  [[ $1 == *".."* ]] && return 1
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
 
 case "$1" in
   bind)
@@ -267,7 +281,15 @@ if ! [[ $key =~ $KEY_SHAPE ]]; then
     hyprctl reload >/dev/null 2>&1 || true
     ;;
   bar)
-    barerr=$(python3 - "$2" "${3:-right}" 2>&1 >/dev/null <<'PY'
+    # `|| true` because the whole point of the next forty lines is to report
+    # what went wrong. Without it `set -e` ends the script the instant the
+    # embedded program exits non-zero — which is every case it was written to
+    # detect: a directory it does not own, a shell.json over the ceiling, JSON
+    # it cannot parse. The refusal was reached, the message was produced, and
+    # then the script died one line before the code that says so, leaving no
+    # notice, no summon, and a panel waiting for a result that never came.
+    # Exactly the silent failure this block's own comments claim to have fixed.
+    barerr=$(python3 - "$2" "${3:-right}" 2>&1 >/dev/null <<'PY' || true
 import json, os, stat, sys, tempfile
 state = sys.argv[1]
 sec = sys.argv[2] if sys.argv[2] in ("left", "center", "right") else "right"
@@ -374,7 +396,8 @@ PY
     if [[ -n $barerr ]]; then
       finish "" "" "$(last_line "$barerr")"
     else
-      finish "" "Bar icon updated" ""
+      # Back to Settings, which is the only place this can be pressed from.
+      finish "" "Bar icon updated" "" "settings"
     fi
     ;;
   remove)
@@ -410,6 +433,13 @@ PY
     [[ -n $id ]] || exit 2
     err=""
     deferred=0
+    # Set before it is read. This branch tests `$attached` further down but
+    # never initialised it, so the value came from whatever the environment
+    # happened to hold: an exported variable of that name would have made every
+    # apply skip the summon and leave the panel gone with no result. Nothing
+    # passes --attached here — the shell restart is the whole point of this
+    # path — so it is fixed empty rather than parsed.
+    attached=""
     # stdout only: merging stderr in meant one warning line made the JSON
     # unparseable, the parser read "unparseable" as "no error", and a REFUSED
     # update was reported as "Updated" — and then restarted the shell.
@@ -473,6 +503,17 @@ if isinstance(d, dict) and d.get("error"):
     err=""
     moved=""
 
+    # No reviewed commit, no install. Everything that makes this path safe —
+    # the still-at check before the clone and the backstop that pins or removes
+    # after it — is written as `if [[ -n $sha ]]`, so an empty one skipped both
+    # and installed whatever HEAD was, which is the failure the whole path
+    # exists to prevent. It was unreachable through the panel; unreachable is
+    # not the same as refused, and this is the wrong place to rely on a caller.
+    if [[ -z $sha ]]; then
+      finish "" "" "nothing was installed: no reviewed version was recorded for it"
+      exit 0
+    fi
+
     if [[ -n $sha ]]; then
       now=$(python3 "$DIR/plugd.py" still-at "$url" "$sha" 2>/dev/null |
         python3 -c 'import json,sys
@@ -520,9 +561,61 @@ else: print(d.get("now") or "unknown")')
     if [[ -z $err && -n $sha && -z $pid ]]; then
       err="installed, but its plugin id was unknown so the version could not be checked"
     fi
+    # The id has to be an id before it is a path. It arrives from the manifest
+    # of a stranger's repository, and everything below joins it onto a
+    # directory and hands it to `omarchy plugin remove`.
+    if [[ -z $err && -n $pid ]] && ! valid_plugin_id "$pid"; then
+      err="installed, but its plugin id is not a valid id, so the version could not be checked"
+    fi
     if [[ -z $err && -n $sha && -n $pid ]]; then
       d="$HOME/.config/omarchy/plugins/$pid"
-      if [[ ! -d $d/.git ]]; then
+      # And it has to name the directory this install actually created.
+      #
+      # `omarchy plugin add` validates the id in the manifest of the commit it
+      # fetches. This backstop was using the id from the commit that was
+      # REVIEWED. With --approved-version after the author has pushed, those
+      # are two different manifests and can carry two different ids — so a
+      # reviewed manifest naming some other installed plugin sent the whole
+      # block below at that plugin's directory: wrong sha, cat-file fails,
+      # `omarchy plugin remove` deletes it, and the report says nothing was
+      # installed while the attacker's unreviewed clone sits there under its
+      # own id. The check that closes it is the obvious one — does this
+      # directory's own manifest agree that this is its id.
+      # Read the way every other read here is done, rather than the way that
+      # is shortest. `[[ -f && ! -L ]]` followed by `open()` tests one file and
+      # opens another — the name can be swapped in between — and `json.load` on
+      # a descriptor has no ceiling, so a manifest of any size came into memory
+      # before anything looked at it. The open refuses on its own terms
+      # instead: no symlink, a regular file, non-blocking so a planted FIFO
+      # cannot park here, and a byte over the ceiling means nothing is
+      # returned rather than something enormous.
+      landed=$(python3 -c '
+import json, os, stat, sys
+CEIL = 256 * 1024
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError:
+    print(""); raise SystemExit
+try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        print(""); raise SystemExit
+    with os.fdopen(fd, "rb") as fh:
+        fd = None
+        raw = fh.read(CEIL + 1)
+    if len(raw) > CEIL:
+        print(""); raise SystemExit
+    d = json.loads(raw.decode("utf-8", "replace"))
+    v = d.get("id") if isinstance(d, dict) else None
+    print(v if isinstance(v, str) else "")
+except (OSError, ValueError):
+    print("")
+finally:
+    if fd is not None:
+        try: os.close(fd)
+        except OSError: pass' "$d/manifest.json" 2>/dev/null || echo "")
+      if [[ -d $d/.git && $landed != "$pid" ]]; then
+        err="installed, but it did not arrive under the id that was reviewed — nothing was changed"
+      elif [[ ! -d $d/.git ]]; then
         err="installed, but $pid is not where it was expected, so the version could not be checked"
       else
         head=$(git -C "$d" rev-parse HEAD 2>/dev/null || echo "")
@@ -586,6 +679,18 @@ else: print(d.get("now") or "unknown")')
     else
       err=$(clear_refs "$id") || true
       note="Disabled $id"
+    fi
+    # `attached` was being set above and then never read, so this branch
+    # summoned the panel on every toggle — the one case the flag exists to
+    # prevent. A summon of a panel that is already open is not a no-op: the
+    # shell delivers it straight to the live instance, whose open() resets the
+    # cursor to the first row, forces the installed tab, drops any review on
+    # screen, and clears the very job state that was guarding the row while
+    # this script was still running. The exit code carries the outcome to the
+    # waiting panel, which is what `--attached` means.
+    if [[ -n $attached ]]; then
+      [[ -n $err ]] && { echo "$err" >&2; exit 1; }
+      exit 0
     fi
     if [[ -n $err ]]; then finish "$id" "" "$err"; else finish "$id" "$note" ""; fi
     ;;
