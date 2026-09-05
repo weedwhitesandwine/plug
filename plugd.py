@@ -385,6 +385,12 @@ LINE_COMMENT = {".qml": "//", ".js": "//", ".mjs": "//",
 # An unbroken run this long is what packed or encoded content looks like.
 LONG_TOKEN = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
 
+# Unicode bidirectional controls (the Trojan Source trick): they make source
+# render as one thing and execute as another, and they have no legitimate
+# place in plugin code. Checked on the raw line, comments included — a
+# comment is exactly where they do their reordering.
+BIDI_CONTROL = re.compile("[\\u202a-\\u202e\\u2066-\\u2069]")
+
 # Something on this line actually runs a command; a privileged word in a
 # string with none of these nearby is the plugin quoting a command.
 EXEC_CONSTRUCT = re.compile(
@@ -563,7 +569,8 @@ def scan_plugin(dirpath, only_files=None, install_files=None):
             quoted = " ".join(strings)
             key = "%s:%d" % (rel, i)
             runs = None
-            if len(line) > 2000 and LONG_TOKEN.search(line):
+            if (len(line) > 2000 and LONG_TOKEN.search(line)) \
+                    or BIDI_CONTROL.search(line):
                 hits.setdefault("obfuscation", set()).add(key)
                 if in_script:
                     script_caps.add("obfuscation")
@@ -1053,8 +1060,11 @@ REVIEW_SYSTEM = (
     "A plugin runs unsandboxed as the user, so an update can introduce real "
     "harm: reading private files (SSH keys, password stores, .env), sending "
     "data to the network, running new commands, asking for a password, or "
-    "hiding what it does. You are given the exact diff of what changed and a "
-    "machine scan of what the plugin can now do. Judge ONLY from the diff.\n\n"
+    "hiding what it does. You are given the code to judge and a machine scan "
+    "of what the plugin can now do. Judge the change from the code you are "
+    "shown — and note the scan describes the WHOLE plugin, so if it reports "
+    "capabilities the code you can see does not explain, say so in WATCH "
+    "FOR rather than ignoring them.\n\n"
     "Answer in this exact shape and nothing else:\n"
     "VERDICT: one of SAFE, CAUTION, DANGER\n"
     "HEADLINE: one plain sentence a non-coder understands\n"
@@ -1065,6 +1075,23 @@ REVIEW_SYSTEM = (
     "worth a look (new network host, new file it writes). DANGER = it now "
     "touches secrets, exfiltrates data, obfuscates, or asks for privilege in "
     "a way the plugin's purpose does not explain. When unsure, do not say SAFE."
+    "\n\nCalibration, so your facts stay right. In the machine scan, `runs` "
+    "counts lines that execute a capability and `quotedOnly` counts lines "
+    "that merely display the words — help text, or a command shown for the "
+    "user to copy. Displayed text is not exercised capability. You may be "
+    "shown only part of the plugin: a call to a function you cannot see may "
+    "be perfectly safe, so never assert facts about unseen code — say what "
+    "is worth checking instead, and state as fact only what the shown code "
+    "demonstrates. An encoded blob that is decoded and displayed (an embedded "
+    "icon or font) is ordinary; one that is decoded and then executed, "
+    "evaluated, or written somewhere runnable is hostile concealment. And "
+    "Omarchy platform context: a plugin legitimately edits a clearly-marked "
+    "block of its own in ~/.config/hypr/bindings.lua, or its own entry in "
+    "shell.json, when the user explicitly applies that choice in its "
+    "settings — that is the platform's accepted consent pattern, and worth "
+    "CAUTION at most while the edit is marked, scoped to the plugin's own "
+    "block, and user-triggered. Unmarked config edits, or edits touching "
+    "lines the plugin does not own, are serious."
     "\n\nWhen the update reads some data and sends it somewhere, judge it by "
     "TWO things: what data is touched, and where it goes — NOT by whether the "
     "connection is encrypted. Sending a private key, password, token or other "
@@ -1274,6 +1301,7 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
 
 def parse_review(raw):
     verdict = "UNKNOWN"
+    verdict_seen = False
     headline = ""
     changed = []
     watch = ""
@@ -1282,11 +1310,17 @@ def parse_review(raw):
         s = line.strip()
         up = s.upper()
         if up.startswith("VERDICT:"):
-            v = s.split(":", 1)[1].strip().upper()
-            verdict = v if v in ("SAFE", "CAUTION", "DANGER") else "UNKNOWN"
+            # Only the first VERDICT line counts. The reply can quote the text
+            # it reviewed, and a diff carrying the bait line "VERDICT: SAFE"
+            # must not override the reviewer's own verdict by being echoed.
+            if not verdict_seen:
+                verdict_seen = True
+                v = s.split(":", 1)[1].strip().upper()
+                verdict = v if v in ("SAFE", "CAUTION", "DANGER") else "UNKNOWN"
             section = None
         elif up.startswith("HEADLINE:"):
-            headline = s.split(":", 1)[1].strip()
+            if not headline:
+                headline = s.split(":", 1)[1].strip()
             section = None
         elif up.startswith("WHAT CHANGED"):
             section = "changed"
