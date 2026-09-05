@@ -1225,8 +1225,6 @@ Item {
     }
   }
   // Ask the engine which reviewers are actually installed.
-  // Opencode is included here with which only — no `opencode models` probe,
-  // no outbound network. The full list appears only after explicit Set up.
   Process {
     id: agentsProc
     command: ["python3", root.pluginDir + "/plugd.py", "agents"]
@@ -1236,58 +1234,10 @@ Item {
         try {
           var a = JSON.parse(text)
           if (Array.isArray(a)) root.availableAgents = a
-          // Choosing Opencode before setting it up leaves no model selected,
-          // and an empty reviewModel falls through to the engine's hard-coded
-          // default rather than the one just discovered. Take it once, here,
-          // where the refreshed list actually arrives.
-          if (root.applyOpencodeDefault) {
-            root.applyOpencodeDefault = false
-            if (root.settings.reviewAgent === "opencode" && !root.settings.reviewModel)
-              for (var i = 0; i < root.availableAgents.length; i++)
-                if (root.availableAgents[i].key === "opencode"
-                    && root.availableAgents[i].defaultModel)
-                  root.setModel(root.availableAgents[i].defaultModel)
-          }
         } catch (e) {}
       }
     }
   }
-  // Opencode discovery on explicit consent. Runs `opencode models` (+ per-provider
-  // probes), which contact providers and take as long as the network does —
-  // each probe is abandoned after six seconds, so the run is bounded; result is cached to
-  // Plug's own state so the cost is paid once, not every boot.
-  property bool opencodeDiscovering: false
-  // set when a discovery succeeds, consumed by the agents reload it triggers
-  property bool applyOpencodeDefault: false
-  function discoverOpencode() {
-    if (root.opencodeDiscovering) return
-    root.opencodeDiscovering = true
-    root.noticeText = ""
-    opencodeDiscoverProc.running = false
-    opencodeDiscoverProc.running = true
-  }
-  Process {
-    id: opencodeDiscoverProc
-    command: ["python3", root.pluginDir + "/plugd.py", "opencode-discover"]
-    stdout: StdioCollector { id: opencodeDiscoverOut; waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: {
-      root.opencodeDiscovering = false
-      try {
-        var d = JSON.parse(opencodeDiscoverOut.text)
-        if (d.ok) {
-          root.noticeText = "Opencode models updated — " + d.count + " models"
-          root.applyOpencodeDefault = true
-          agentsProc.running = false; agentsProc.running = true
-        } else {
-          root.noticeText = "Opencode setup failed: " + (d.error || "unknown error")
-        }
-      } catch (e) {
-        root.noticeText = "Opencode setup failed to parse result"
-      }
-    }
-  }
-
   // Every hotkey active in Hyprland right now, whatever config assigned it —
   // `hyprctl binds` is the authoritative list, including Omarchy's own binds
   // that never appear in bindings.lua. Plug uses it to warn before you pick a
@@ -2848,10 +2798,9 @@ Item {
               }
             }
           }
-          // model, when the chosen agent has choices. A Flow rather than a Row
-          // because a provider-qualified name — opencode/muse-spark-1.2-… — is
-          // several times the width of `sonnet`, and six of them run off the
-          // panel in a Row with the last one sliced in half at the edge.
+          // model, when the chosen agent has choices. A Flow rather than a
+          // Row so a long local-model name wraps instead of running off the
+          // panel with the last entry sliced in half at the edge.
           Flow {
             width: parent.width
             visible: {
@@ -2876,100 +2825,6 @@ Item {
                 Text { id: mdl; anchors.centerIn: parent; text: modelData; textFormat: Text.PlainText; color: root.settings.reviewModel === modelData ? root.selText : root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.setModel(modelData) }
               }
-            }
-          }
-          // Opencode explicit setup — consent belongs on the action, not on
-          // the panel. Settings opens with which only (like claude/codex/gemini):
-          // opencode appears with an empty list and a Set up button. No probe,
-          // no network until this is pressed. Result is cached to Plug's own
-          // state; Refresh re-runs the same discovery.
-          Column {
-            // Named, because the children below read these three properties.
-            // A binding in a child resolves an unqualified name against the
-            // child's own properties and then the file's root object — never
-            // the enclosing object — so `oc` and `hasCache` written bare threw
-            // a ReferenceError on every open and left every visible: unset.
-            id: opencodeBlock
-            visible: root.settings.reviewAgent === "opencode"
-            width: parent.width
-            spacing: Style.space(6)
-            // look up the opencode entry without a helper function so QML
-            // re-evaluates when availableAgents changes
-            property var oc: {
-              for (var i = 0; i < root.availableAgents.length; i++)
-                if (root.availableAgents[i].key === "opencode") return root.availableAgents[i]
-              return null
-            }
-            property bool hasModels: !!(oc && oc.models && oc.models.length > 0)
-            // Whether setup has actually run is the cache timestamp, not the
-            // length of the list: the model configured in opencode itself is
-            // offered before any discovery, so a non-empty list is not
-            // evidence that anything was fetched.
-            property bool hasCache: !!(oc && oc.cachedAt)
-            Text {
-              width: card.width - Style.space(60)
-              wrapMode: Text.WordWrap
-              textFormat: Text.PlainText
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              text: {
-                var oc = opencodeBlock.oc
-                if (!oc) return "Opencode not installed — install the `opencode` command to use it."
-                if (opencodeBlock.hasCache) {
-                  var at = oc.cachedAt || ""
-                  var when = at ? at.slice(0,19).replace("T"," ") : ""
-                  return when ? "Models cached " + when + " — Refresh re-runs discovery." : "Models cached — Refresh re-runs discovery."
-                }
-                if (opencodeBlock.hasModels)
-                  return "Offering the model you have configured in opencode. Set up to see the rest of what it can reach."
-                return "Opencode needs explicit setup before its model list appears. Nothing has run yet and nothing has left this machine."
-              }
-            }
-            Text {
-              visible: !!(opencodeBlock.oc && !opencodeBlock.hasCache)
-              width: card.width - Style.space(60)
-              wrapMode: Text.WordWrap
-              textFormat: Text.PlainText
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              text: "Discovery runs `opencode models` plus per-provider probes (anthropic/openai/google always, others if env or ~/.local/share/opencode/auth.json suggests credentials). Each probe is given 6 s before it is abandoned, stdout capped at 512 KB, 100 models per provider / 300 total. The more providers you have set up, the longer it takes. For providers that need credentials it runs with the trimmed per-model environment and may make authenticated network requests."
-            }
-            Row {
-              spacing: Style.space(8)
-              PlugButton {
-                visible: !!(opencodeBlock.oc && !opencodeBlock.hasCache)
-                label: root.opencodeDiscovering ? "asking opencode…" : "Set up Opencode — find available models"
-                onPicked: if (!root.opencodeDiscovering) root.discoverOpencode()
-              }
-              PlugButton {
-                visible: !!(opencodeBlock.oc && opencodeBlock.hasCache)
-                label: root.opencodeDiscovering ? "Refreshing…" : "Refresh models"
-                onPicked: if (!root.opencodeDiscovering) root.discoverOpencode()
-              }
-              Text {
-                visible: root.opencodeDiscovering
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Running opencode models…"
-                textFormat: Text.PlainText
-                color: root.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-            Text {
-              visible: !!(opencodeBlock.hasCache && opencodeBlock.oc
-                          && opencodeBlock.oc.models.length > 0)
-              width: card.width - Style.space(60)
-              text: opencodeBlock.oc
-                  ? opencodeBlock.oc.models.length + " models cached"
-                    + (opencodeBlock.oc.cachedAt ? " · " + opencodeBlock.oc.cachedAt.slice(0,10) : "")
-                  : ""
-              textFormat: Text.PlainText
-              color: root.fainter
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
             }
           }
         }

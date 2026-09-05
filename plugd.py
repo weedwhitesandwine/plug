@@ -46,15 +46,10 @@ CATALOG_FILE = os.path.join(STATE_DIR, "catalog.json")
 # bookkeeping recorded by earlier versions survives the upgrade.
 HISTORY_FILE = os.path.join(STATE_DIR, "locks.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
-# Opencode model list is cached on explicit user action, not at startup.
-# Discovery runs `opencode models` (+ per-provider probes) which may take
-# ~13 s and contact providers; it is not triggered by opening Settings or
-# at shell startup, only by the Set up / Refresh button in Settings.
-OPENCODE_CACHE_FILE = os.path.join(STATE_DIR, "opencode_models.json")
 
 # The AI reviewer is the user's choice, so a published Plug does not assume
 # anyone has a particular tool. Two kinds are supported:
-#   type "cli"  — a command-line agent (Claude Code, Codex, Gemini). Plug runs
+#   type "cli"  — a command-line agent (Claude Code). Plug runs
 #                 it once, read-only, with the diff as the prompt.
 #   type "http" — a local server exposing an OpenAI-compatible API (Ollama, LM
 #                 Studio). Plug POSTs the diff to localhost, so the review runs
@@ -67,29 +62,6 @@ AGENTS = {
     "claude": {
         "label": "Claude Code", "type": "cli", "bin": "claude",
         "models": ["sonnet", "opus", "haiku"], "default_model": "sonnet",
-        "private": False,
-    },
-    "codex": {
-        "label": "Codex CLI", "type": "cli", "bin": "codex",
-        "models": ["gpt-5-codex", "o4-mini"], "default_model": "gpt-5-codex",
-        "private": False,
-    },
-    "gemini": {
-        "label": "Gemini CLI", "type": "cli", "bin": "gemini",
-        "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
-        "default_model": "gemini-2.5-flash", "private": False,
-    },
-    "opencode": {
-        "label": "Opencode", "type": "cli", "bin": "opencode",
-        "models": [
-            "opencode/muse-spark-1.2-contributor-free",
-            "opencode/big-pickle",
-            "opencode/mimo-v2.5-free",
-            "opencode/nemotron-3-ultra-free",
-            "opencode/nemotron-3.5-lightning-free",
-            "opencode/ling-3.0-flash-fin-free",
-        ],
-        "default_model": "opencode/muse-spark-1.2-contributor-free",
         "private": False,
     },
     "ollama": {
@@ -1176,120 +1148,6 @@ def http_agent_models(spec):
     return models
 
 
-def opencode_cli_models(spec):
-    """Ask the opencode CLI what models it knows. Returns None if opencode
-    is not usable, otherwise a list (possibly empty). Tries `opencode models`
-    so Zen and provider models stay current without hard-coding.
-    If your default is not Zen (e.g. anthropic/claude-*, openai/gpt-*),
-    `opencode models` without a filter only lists opencode/*; so
-    provider-specific listings are also tried when credentials are present."""
-    def _run_models(args, provider=""):
-        # provider is the opencode provider being listed (e.g. "anthropic")
-        # for env isolation; "" means generic listing (only OPENCODE_)
-        try:
-            prov_model = (provider + "/x") if provider else ""
-            env = reviewer_env("opencode", prov_model)
-            proc = subprocess.Popen(
-                [spec["bin"]] + args,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                env=env,
-            )
-            try:
-                # Cap stdout while reading, not after, so a huge reply cannot
-                # be held whole. Reuse the same ceiling as agent replies. This
-                # spawn lives inside the try because if it raises, the finally
-                # below is what stops opencode being left running with its
-                # pipe open inside a shell process that stays up for days.
-                capper = subprocess.Popen(
-                    ["head", "-c", str(MAX_AGENT_BYTES)],
-                    stdin=proc.stdout, stdout=subprocess.PIPE)
-                proc.stdout.close()
-                out, _ = capper.communicate(timeout=6)
-            except subprocess.TimeoutExpired:
-                capper.kill()
-                out, _ = capper.communicate()
-                raise
-            finally:
-                if proc.poll() is None:
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=2)
-            if proc.returncode != 0:
-                # head -c closes the pipe at the ceiling; the writer then
-                # gets SIGPIPE (141) which is not a real failure — it just
-                # means we stopped reading at the cap.
-                if len(out or b"") < MAX_AGENT_BYTES:
-                    return None
-            lst = []
-            for line in (out or b"").decode("utf-8", "replace").splitlines():
-                s = line.strip()
-                if s and "/" in s and not s.startswith("#"):
-                    lst.append(s)
-                    if len(lst) >= 100:
-                        break
-            return lst[:100]
-        except Exception:
-            return None
-
-    try:
-        models = _run_models(["models"])
-        if models is None:
-            return None
-        # Cap the base list and build a set for O(1) dedup.
-        if len(models) > 100:
-            models = models[:100]
-        seen = set(models)
-        # If the user does not use Zen, their provider's models do not appear
-        # in the general listing. Try common providers if there is a hint
-        # of a credential (env or auth.json) to avoid leaving their real
-        # provider's list empty. anthropic/openai/google are always tried
-        # because they are the most common without Zen.
-        always = {"anthropic", "openai", "google"}
-        if models == [] or any(m.startswith("opencode/") for m in models):
-            for prov in ("anthropic", "openai", "google", "openrouter", "azure", "mistral", "groq", "deepseek", "xai", "cohere"):
-                if len(models) >= 300:
-                    break
-                should_try = prov in always
-                if not should_try:
-                    has_env = any(prov in k.lower() for k in os.environ)
-                    has_auth = False
-                    try:
-                        auth_path = os.path.join(HOME, ".local/share/opencode/auth.json")
-                        if os.path.exists(auth_path):
-                            raw = read_capped(auth_path, 64 * 1024, follow=True).decode("utf-8", "replace")
-                            try:
-                                doc = json.loads(raw)
-                            except ValueError:
-                                try:
-                                    doc = json.loads(_strip_jsonc(raw))
-                                except ValueError:
-                                    doc = None
-                            if isinstance(doc, dict):
-                                has_auth = prov in {k.lower() for k in doc.keys() if isinstance(k, str)}
-                    except Exception:
-                        pass
-                    should_try = has_env or has_auth
-                if not should_try:
-                    continue
-                prov_models = _run_models(["models", prov], provider=prov)
-                if prov_models is None:
-                    continue
-                for m in prov_models:
-                    if len(models) >= 300:
-                        break
-                    if m not in seen:
-                        models.append(m)
-                        seen.add(m)
-        # An opencode that ran and listed nothing has told us something true.
-        # Substituting the hard-coded Zen list here would cache models the user
-        # may have no access to and report it as a successful setup.
-        return models[:300]
-    except Exception:
-        return None
-
-
 def agent_available(agent_key):
     spec = AGENTS.get(agent_key)
     if not spec:
@@ -1306,73 +1164,17 @@ def available_agents():
     """Which reviewers are actually usable right now — CLIs that are installed
     and local servers that are running. The panel offers only these, plus
     'none', so a user never picks an agent they do not have. Local-server
-    models are read live from the server.
-
-    Opencode is treated like other CLIs here: presence is `which` only, no
-    `opencode models` probe and no outbound network. The full model list is
-    discovered on explicit user action (Set up / Refresh in Settings) and
-    cached to `opencode_models.json`; until then opencode appears with an
-    empty model list so the user can opt in."""
+    models are read live from the server."""
     out = []
     for key, spec in AGENTS.items():
         if spec["type"] == "cli":
             from shutil import which
             if which(spec["bin"]) is None:
                 continue
-            if key == "opencode":
-                # No network here — which only, like claude/codex/gemini.
-                # Cached models, if any, are read from Plug's own state.
-                # Read with the ceiling the writer can actually reach: 300 entries
-                # of arbitrary length will not fit in 64 KB, and a cache
-                # over the ceiling reads as absent, which strands setup.
-                cached = read_json(OPENCODE_CACHE_FILE, MAX_AGENT_BYTES, None)
-                models = []
-                cached_at = ""
-                if isinstance(cached, dict) and isinstance(cached.get("models"), list):
-                    models = [m for m in cached["models"]
-                              if isinstance(m, str) and "/" in m][:300]
-                    v = cached.get("fetchedAt")
-                    if isinstance(v, str):
-                        cached_at = v
-                # The model the user has already chosen in opencode's own
-                # configuration is read whether or not discovery has run. It is
-                # two local file reads, and skipping them before discovery is
-                # what made a non-Zen user fall back to a hard-coded Zen model
-                # with their provider credentials trimmed away — the very case
-                # the earlier commit here set out to fix.
-                configured = ""
-                for cfg_path in (
-                    os.path.join(HOME, ".config/opencode/opencode.json"),
-                    os.path.join(HOME, ".config/opencode/opencode.jsonc"),
-                ):
-                    cfg = _load_opencode_config(cfg_path, 64 * 1024)
-                    if isinstance(cfg, dict) and isinstance(cfg.get("model"), str):
-                        configured = cfg["model"].strip()
-                        if configured:
-                            break
-                if not configured:
-                    configured = os.environ.get("OPENCODE_MODEL", "").strip()
-                if configured:
-                    # Offer it even with nothing cached: it is the model the
-                    # user has actually set up, so it is the one that works.
-                    if configured not in models:
-                        models = [configured] + models
-                        if len(models) > 300:
-                            models = models[:300]
-                    default = configured
-                elif models:
-                    dm = spec.get("default_model", "")
-                    default = dm if dm in models else models[0]
-                else:
-                    default = ""
-                entry = {"key": key, "label": spec["label"], "models": models,
-                         "defaultModel": default, "private": spec.get("private", False),
-                         "cachedAt": cached_at}
-            else:
-                models = spec["models"]
-                default = spec["default_model"]
-                entry = {"key": key, "label": spec["label"], "models": models,
-                         "defaultModel": default, "private": spec.get("private", False)}
+            models = spec["models"]
+            default = spec["default_model"]
+            entry = {"key": key, "label": spec["label"], "models": models,
+                     "defaultModel": default, "private": spec.get("private", False)}
         else:
             models = http_agent_models(spec)
             if models is None:
@@ -1382,32 +1184,6 @@ def available_agents():
                      "defaultModel": default, "private": spec.get("private", False)}
         out.append(entry)
     return out
-
-
-def discover_opencode_models():
-    """Run `opencode models` (+ per-provider probes) on explicit user action
-    and cache the result to Plug's own state.
-
-    This is the ONLY place that triggers outbound network to providers.
-    It is not called at startup nor when Settings opens — only when the user
-    presses Set up / Refresh in Settings. Result is cached so the cost is
-    paid once, not every boot. Stdout is capped via head -c and per-provider
-    / overall caps (100 / 300) bound memory."""
-    spec = AGENTS.get("opencode")
-    if not spec:
-        return {"ok": False, "error": "opencode not configured"}
-    if shutil.which(spec["bin"]) is None:
-        return {"ok": False, "error": "opencode not installed"}
-    models = opencode_cli_models(spec)
-    if models is None:
-        return {"ok": False, "error": "opencode models probe failed (no output or not authenticated)"}
-    # opencode_cli_models already caps per-provider 100 / overall 300 and
-    # falls back to spec models if discovery returned empty — cache that too.
-    capped = models[:300]
-    obj = {"models": capped, "fetchedAt": now_iso(), "count": len(capped)}
-    write_atomic(OPENCODE_CACHE_FILE, obj)
-    return {"ok": True, "models": obj["models"], "fetchedAt": obj["fetchedAt"],
-            "count": obj["count"]}
 
 
 def installed_ids():
@@ -1535,167 +1311,13 @@ ENV_KEEP = frozenset((
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
 ))
-# Provider-specific env prefixes for opencode. Only OPENCODE_ is always
-# kept; provider credentials are added only for the model being used, so
-# e.g. opencode/* -> OPENCODE_, anthropic/* -> OPENCODE_+ANTHROPIC_, etc.
-# An unknown provider gets only OPENCODE_, so AWS_SECRET_ACCESS_KEY never
-# leaks into an opencode process that has no business seeing it.
-_PROVIDER_ENV_PREFIXES = {
-    "anthropic": ("ANTHROPIC_", "CLAUDE_"),
-    "openai": ("OPENAI_",),
-    "google": ("GOOGLE_", "GEMINI_"),
-    "gemini": ("GOOGLE_", "GEMINI_"),
-    "openrouter": ("OPENROUTER_",),
-    "azure": ("AZURE_",),
-    "mistral": ("MISTRAL_",),
-    "groq": ("GROQ_",),
-    "deepseek": ("DEEPSEEK_",),
-    "xai": ("XAI_",),
-    "cohere": ("COHERE_",),
-    "huggingface": ("HUGGINGFACE_", "HF_"),
-    "aws": ("AWS_",),
-    "bedrock": ("AWS_",),
-    "amazon": ("AWS_",),
-}
 ENV_KEEP_PREFIXES = {
     "claude": ("ANTHROPIC_", "CLAUDE_"),
-    "codex": ("OPENAI_", "CODEX_"),
-    "gemini": ("GEMINI_", "GOOGLE_"),
-    "opencode": ("OPENCODE_",),  # base; provider prefixes added per-model
 }
-
-
-def _opencode_keep_for_model(model):
-    """Env prefixes to keep for an opencode model (e.g. anthropic/claude...).
-
-    Always keeps OPENCODE_. Adds provider-specific prefixes only for known
-    providers; unknown providers get only OPENCODE_ so unrelated secrets
-    (e.g. AWS_SECRET_ACCESS_KEY) are not exposed.
-    """
-    if not model or not isinstance(model, str):
-        return ("OPENCODE_",)
-    prov = model.split("/", 1)[0].strip().lower() if "/" in model else model.strip().lower()
-    if not prov or prov == "opencode":
-        return ("OPENCODE_",)
-    extra = _PROVIDER_ENV_PREFIXES.get(prov)
-    if extra:
-        return ("OPENCODE_",) + extra
-    return ("OPENCODE_",)
-
-
-def _strip_jsonc(text):
-    """Strip // and /* */ comments outside strings and trailing commas."""
-    out = []
-    in_str = False
-    str_char = ""
-    escaped = False
-    in_block = False
-    in_line = False
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-        if in_line:
-            if ch == "\n":
-                in_line = False
-                out.append(ch)
-            i += 1
-            continue
-        if in_block:
-            if ch == "*" and nxt == "/":
-                in_block = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_str:
-            out.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == str_char:
-                in_str = False
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            in_str = True
-            str_char = ch
-            out.append(ch)
-            i += 1
-            continue
-        if ch == "/" and nxt == "/":
-            in_line = True
-            i += 2
-            continue
-        if ch == "/" and nxt == "*":
-            in_block = True
-            i += 2
-            continue
-        out.append(ch)
-        i += 1
-    stripped = "".join(out)
-    # Trailing commas: remove a comma that is followed only by whitespace and
-    # then } or ], but only when outside a string. The comment stripper already
-    # tracked string state; reuse the same discipline here — a blind regex
-    # over the whole text would mangle values containing ", }".
-    out2 = []
-    in_str = False
-    str_char = ""
-    escaped = False
-    i = 0
-    n = len(stripped)
-    while i < n:
-        ch = stripped[i]
-        if in_str:
-            out2.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == str_char:
-                in_str = False
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            in_str = True
-            str_char = ch
-            out2.append(ch)
-            i += 1
-            continue
-        if ch == ",":
-            j = i + 1
-            while j < n and stripped[j] in " \t\r\n":
-                j += 1
-            if j < n and stripped[j] in "}]":
-                i = j
-                continue
-        out2.append(ch)
-        i += 1
-    return "".join(out2)
-
-
-def _load_opencode_config(path, ceiling=64 * 1024):
-    """Read an opencode.json / jsonc config, tolerating comments and trailing commas."""
-    try:
-        raw = read_capped(path, ceiling, follow=True).decode("utf-8", "replace")
-    except (OSError, ValueError):
-        return {}
-    try:
-        return json.loads(raw)
-    except ValueError:
-        try:
-            return json.loads(_strip_jsonc(raw))
-        except ValueError:
-            return {}
 
 
 def reviewer_env(agent, model=""):
-    if agent == "opencode":
-        keep = _opencode_keep_for_model(model)
-    else:
-        keep = ENV_KEEP_PREFIXES.get(agent, ())
+    keep = ENV_KEEP_PREFIXES.get(agent, ())
     env = {k: v for k, v in os.environ.items()
            if k in ENV_KEEP or k.startswith("LC_") or k.startswith(keep)}
     # Its own configuration and credentials live under the real home, so the
@@ -1939,40 +1561,6 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                 # On standard input, so the size of the change cannot decide
                 # whether it gets reviewed.
                 stdin_text = prompt
-            elif agent == "codex":
-                # Read-only sandbox, no network, one shot. The framing goes in
-                # the prompt since codex has no separate system-prompt flag.
-                # --skip-git-repo-check because the reviewer deliberately
-                # runs in an empty directory that is not a repository, and
-                # without it codex refuses to start at all — the reviewer you
-                # chose would fall back to the offline scan without saying so.
-                cmd = ["codex", "exec", "--sandbox", "read-only",
-                       "--skip-git-repo-check"]
-                if model:
-                    cmd += ["--model", model]
-                cmd += [arg_prompt(REVIEW_SYSTEM + "\n\n" + prompt)]
-            elif agent == "gemini":
-                # Gemini CLI, one-shot prompt mode, in its own read-only
-                # approval mode — the nearest thing it offers to Claude's
-                # plan mode. Its --sandbox needs a container runtime that may
-                # not be here, so it is not assumed; see the README, which
-                # says plainly what each reviewer does and does not get.
-                cmd = ["gemini", "--approval-mode", "plan"]
-                if model:
-                    cmd += ["-m", model]
-                cmd += ["-p", arg_prompt(REVIEW_SYSTEM + "\n\n" + prompt)]
-            elif agent == "opencode":
-                # Opencode — non-interactive `run` with JSON events. The `plan`
-                # agent denies edits (read-only) which mirrors Claude's plan
-                # mode; the empty working directory keeps even reads harmless.
-                # Prompt travels as an argument, trimmed to the OS limit so a
-                # large diff degrades gracefully rather than failing silently.
-                # "--" prevents a prompt starting with "-" being parsed as a flag.
-                cmd = ["opencode", "run", "--format", "json",
-                       "--agent", "plan"]
-                if model:
-                    cmd += ["-m", model]
-                cmd += ["--", arg_prompt(REVIEW_SYSTEM + "\n\n" + prompt)]
             else:
                 return offline_summary(diff, scan_facts, plugin_name, context)
 
@@ -2013,26 +1601,6 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                         proc.kill()
                     proc.wait(timeout=5)
                 raw = (out or b"").decode("utf-8", "replace").strip()
-                # Opencode's JSON mode emits NDJSON events; extract text parts
-                if agent == "opencode" and raw:
-                    try:
-                        texts = []
-                        for ln in raw.splitlines():
-                            ln = ln.strip()
-                            if not ln:
-                                continue
-                            try:
-                                ev = json.loads(ln)
-                            except ValueError:
-                                continue
-                            if ev.get("type") == "text" and isinstance(ev.get("part"), dict):
-                                t = ev["part"].get("text")
-                                if isinstance(t, str) and t.strip():
-                                    texts.append(t)
-                        if texts:
-                            raw = "\n".join(texts).strip()
-                    except Exception:
-                        pass
             finally:
                 # rmdir only removes an empty directory, and this one is handed
                 # to an agent as its working directory — anything it chose to
@@ -2501,7 +2069,6 @@ def main():
     sub.add_parser("check-updates")
     sub.add_parser("catalog")
     sub.add_parser("agents")
-    sub.add_parser("opencode-discover")
     for name in ("scan", "review", "apply", "rollback", "forget"):
         p = sub.add_parser(name)
         p.add_argument("id")
@@ -2545,8 +2112,6 @@ def main():
             print(json.dumps({"ok": False, "error": str(e)[:200]}))
     elif args.cmd == "agents":
         print(json.dumps(available_agents()))
-    elif args.cmd == "opencode-discover":
-        print(json.dumps(discover_opencode_models()))
     elif args.cmd == "scan":
         inv = installed_ids()
         if args.id not in inv:
