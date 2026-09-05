@@ -98,6 +98,17 @@ tools you actually have:
   environment it sees carries its own credentials and nothing else your shell
   or your real home was carrying. It reads the diff it was given and has
   nothing else to act with.
+- **Opencode** — if the `opencode` command is installed **and** `bwrap`
+  (bubblewrap) is, because Opencode keeps its own tools and Plug will not run a
+  reviewer with tools outside a sandbox. It runs inside one: its home is a
+  throwaway in memory, its working directory is empty, the system is mounted
+  read-only, and nothing of your real home is inside it except the Opencode
+  program itself and its own credentials. Its settings in there are Plug's, not
+  yours, and they deny editing, shell commands and web fetches; its plugins are
+  switched off. It can reach its model and nothing of yours. Models are listed
+  from Opencode itself with its free tier first, and a free one is the default,
+  so choosing this reviewer does not spend provider credit unless you pick a
+  model that does.
 - **Local servers** — Ollama or LM Studio, if they are running. The review is a
   request to `localhost`, so **nothing leaves your machine** — a real LLM review
   that is completely private. Their loaded models are listed automatically.
@@ -110,14 +121,16 @@ windows, not something Plug can call for a one-shot review.
 
 Authentication belongs to the reviewer you chose: Plug runs its command, and
 that command uses the sign-in it already has. With Claude Code, that is the
-Claude account set up in your terminal. If the tool is not signed in, the review
-falls back to the offline scan.
+Claude account set up in your terminal; with Opencode, whatever
+`opencode auth login` saved, or a provider key already in your environment. If
+the tool is not signed in, the review falls back to the offline scan.
 
-**Privacy.** Claude Code is sent the code it is asked
-to judge, and only then: the diff when you review an update, the plugin's full
-source when you check one before installing it. That code is public and comes
-from a public repository, but it does leave your machine. A local server (Ollama,
-LM Studio) or the offline scan keeps everything on it.
+**Privacy.** A reviewer that runs somewhere else — Claude Code, or Opencode on
+a provider model — is sent the code it is asked to judge, and only then: the
+diff when you review an update, the plugin's full source when you check one
+before installing it. That code is public and comes from a public repository,
+but it does leave your machine. A local server (Ollama, LM Studio) or the
+offline scan keeps everything on it.
 
 ## Install
 
@@ -161,7 +174,10 @@ version each applied update came from), `review-<plugin-id>.json` (the last
 review of that plugin: the verdict, the summary, and the two commits it was
 read between, which is what the apply is checked against), and
 `outcome.json` (the result of the last job — written when an install, update,
-restore or removal finishes, shown and deleted the next time Plug opens).
+restore or removal finishes, shown and deleted the next time Plug opens), and,
+if you use Opencode, `opencode-models.json` and `opencode-bin.json` (its model
+list and where its program actually lives, both cached so Plug does not ask
+again on every settings open).
 
 **Outside its own directory** — only in response to something you do:
 
@@ -185,8 +201,9 @@ own `plug-ctl.sh`, which holds the two consent edits: the hotkey block and the
 bar-icon entry); `wl-copy` (only when you press **Copy the commands** on a
 manual install, with the commands passed as an argument rather than through a
 shell); `xdg-open` (only when you open a plugin's repository page); and the AI
-reviewer you chose — either the `claude` command or a request to a local
-server on `localhost`.
+reviewer you chose — the `claude` command, the `opencode` command inside a
+`bwrap` sandbox (with `opencode models` to list what it can run), or a request
+to a local server on `localhost`.
 
 **What runs when the shell starts.** Plug builds its reviewer list once, as the
 shell loads it. That run does three things: `which claude` and `which opencode`;
@@ -244,11 +261,17 @@ shell process that stays up for days, so all of it is treated as data:
 - A hotkey is validated against a fixed shape in both the settings view and the
   helper script, and refused rather than escaped, because it becomes Lua source
   in `bindings.lua`.
-- The AI reviewer is handed the diff as data, never as instructions, in an
+- The AI reviewer is handed the code as data, never as instructions, in an
   empty working directory, under a throwaway home directory holding only the
-  reviewer's own settings, with an environment trimmed to its own
-  credentials. Claude Code runs in plan mode with no tools at all, so it has
-  genuinely nothing to act with beyond the text it was given.
+  reviewer's own settings, with an environment trimmed to its own credentials.
+  Claude Code runs in plan mode with no tools at all, so it has genuinely
+  nothing to act with beyond the text it was given. A reviewer that does keep
+  its tools runs inside a bubblewrap sandbox instead — read-only system, a
+  home that exists only in memory, none of your files inside it, and its tools
+  denied — and is not offered at all if that sandbox cannot be built.
+- The reviewer is told that comments and commit messages in what it is reading
+  were written by whoever wrote the code, so a payload labelled "harmless test
+  fixture" is judged by what it does rather than by what it says about itself.
 - `git` runs against each untrusted checkout with the repository's own hooks and
   config disabled, so inspecting a plugin can never run code from it.
 - A repository address is checked against a plain `https` shape before git is
@@ -288,7 +311,9 @@ enormous.
 ## Dependencies
 
 `git`, `python3`, `bash` and `hyprctl`, all of which Omarchy already provides.
-An AI reviewer is optional — without one, Plug uses its offline scan.
+An AI reviewer is optional — without one, Plug uses its offline scan. The
+Opencode reviewer additionally needs `bwrap` (the `bubblewrap` package) for the
+sandbox it runs in, and is simply not offered without it.
 
 ## Licence
 
@@ -296,6 +321,6 @@ MIT — see [LICENSE](LICENSE).
 
 ## Credits
 
-Opencode support was contributed by [miguepollo](https://github.com/miguepollo) (removed in 0.14.0 with the other third-party CLI reviewers, with thanks).
+Opencode support was contributed by [miguepollo](https://github.com/miguepollo).
 
 Built with [Claude Code](https://claude.com/claude-code).
