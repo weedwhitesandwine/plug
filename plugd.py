@@ -1432,6 +1432,12 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                     json.dump({"permission": {"edit": "deny", "bash": "deny",
                                               "webfetch": "deny"}}, f)
                 pkg = opencode_package_dir(binpath)
+                # Opencode's own credential store, if it has one. A key set
+                # up with `opencode auth login` lives here rather than in the
+                # environment, and without this the jailed reviewer has no
+                # account at all. Read-only, and it is the reviewer's own
+                # credential — the same thing Claude Code is trusted with.
+                auth = os.path.join(HOME, ".local/share/opencode/auth.json")
                 argv = [binpath, "run", "--pure", "--format", "json",
                         "--agent", "plan"]
                 # Always explicit, so a review runs on the model the user
@@ -1442,6 +1448,7 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                 cmd, _ = jail_argv(
                     argv + ["--", REVIEW_SYSTEM + "\n\n" + prompt],
                     ro_binds=((pkg, pkg),
+                              (auth, "/jail/home/.local/share/opencode/auth.json"),
                               (cfg, "/jail/home/.config/opencode/opencode.json")))
                 # stdin closed: with a terminal on stdin Opencode waits for
                 # input that is never coming and the review hangs until the
