@@ -26,8 +26,9 @@ Ui.BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // nf-fa-plug (U+F1E6)
-    text: ""
+    // nf-fa-plug (U+F1E6), as an escape so the glyph survives editors that
+    // drop private-use characters.
+    text: "\uf1e6"
     tooltipText: root.updateCount > 0
       ? ("Plug — " + root.updateCount + " update" + (root.updateCount === 1 ? "" : "s") + " waiting")
       : "Plug"
