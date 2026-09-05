@@ -176,8 +176,11 @@ again on every settings open).
 **Commands it runs:** `python3` (Plug's own engine, `plugd.py` — every job
 goes through it); `omarchy-shell shell listPlugins` / `listShellConfig` /
 `setPluginEnabled` (read the list and your shell config; enable/disable on your
-click); `omarchy-restart-shell` (only after you apply an update or a restore —
-see below — and never while the screen is locked) with `omarchy-shell shell
+click); `head`, which every command's output is piped through so nothing
+oversized is ever held; `omarchy-hyprland-session-locked`, asked before a
+restart so one never happens over a lock screen; `omarchy-restart-shell` (only
+after you apply an update or a restore — see below — and never while the screen
+is locked) with `omarchy-shell shell
 ping` / `summon` to bring Plug back afterwards; `omarchy plugin add` / `remove`
 (install/uninstall on your click); `git` inside each plugin's checkout (read its
 state, fetch updates, show the diff, apply or revert); `hyprctl binds` (read
