@@ -1804,9 +1804,11 @@ Item {
                   text: {
                     if (!root.reviewData) return ""
                     var v = root.reviewData.review.verdict
-                    return v === "SAFE" ? "Safe to update"
+                    var install = root.reviewMode === "install"
+                    return v === "SAFE" ? (install ? "Safe to install" : "Safe to update")
                          : v === "CAUTION" ? "Be careful"
-                         : v === "DANGER" ? "Do not update" : "Unclear"
+                         : v === "DANGER" ? (install ? "Do not install" : "Do not update")
+                         : "Unclear"
                   }
                   textFormat: Text.PlainText
                   color: root.foreground
