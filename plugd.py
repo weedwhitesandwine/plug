@@ -1398,6 +1398,14 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
     agent = settings.get("reviewAgent", "claude")
     model = settings.get("reviewModel") or AGENTS.get(agent, {}).get(
         "default_model", "")
+    # The model name comes out of a settings file, which can be hand-edited or
+    # restored from a backup, and it goes into an argument list beside a flag.
+    # A value beginning with `-` is read by some parsers as another option
+    # rather than as that flag's value, so a stored "model" could turn into a
+    # switch nobody chose. It has one legitimate shape; anything else is
+    # dropped rather than escaped.
+    if not MODEL_NAME_RE.fullmatch(str(model or "")):
+        model = ""
 
     if agent == "none" or not agent_available(agent):
         return offline_summary(diff, scan_facts, plugin_name, context)
@@ -1488,8 +1496,9 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                 # Its settings inside the jail are ours, not the user's: every
                 # tool denied, so the reviewer reads the prompt and nothing
                 # else. --pure keeps the user's Opencode plugins out of it.
-                cfg = os.path.join(jail, "opencode.json")
-                with open(cfg, "w") as f:
+                fd, cfg = tempfile.mkstemp(prefix="opencode.", suffix=".json",
+                                           dir=jail)
+                with os.fdopen(fd, "w") as f:
                     json.dump({"permission": {"edit": "deny", "bash": "deny",
                                               "webfetch": "deny"}}, f)
                 pkg = opencode_package_dir(binpath)
@@ -1680,6 +1689,9 @@ REPO_URL_RE = re.compile(
     r"^https://[A-Za-z0-9._~-]+(\.[A-Za-z0-9._~-]+)+(/[A-Za-z0-9._~%/-]*)?$")
 
 PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+# A reviewer model name: provider/model, and never leading with a dash.
+MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,119}")
 
 
 def valid_plugin_id(pid):
