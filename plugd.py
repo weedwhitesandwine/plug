@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """Plug's engine.
 
-Everything the panel cannot do itself: the git state of every installed
-plugin, whether an update is waiting upstream, a fast offline read of what
-each plugin is capable of, the marketplace catalog, and — the point of the
-whole thing — a plain-English review of an update's changes, written by
-Claude for someone who does not read code.
+The panel (Panel.qml) renders; this program does everything else: the git
+state of every installed plugin, the update flags, the capability scan behind
+the trust mark, the marketplace catalog, the AI review of code before it is
+installed or updated, and the jobs — install, update, restore, remove,
+enable, disable — that have to outlive the panel because they end in a shell
+reload. It runs as a fresh process per command and prints one JSON document
+on stdout. Jobs leave their result in outcome.json for the next panel open.
 
-The panel gets the live installed/enabled list straight from the shell
-(`omarchy-shell shell listPlugins`). This engine writes an auxiliary state
-file keyed by plugin id that the panel joins onto that list: the update flag,
-the trust read, the update history. Nothing here is on a timer of its own; the
-panel runs it, and an optional systemd timer runs `check-updates`.
-
-Standard library only. Reads and writes are capped and staged the same way
-the rest of these plugins learned to do the hard way: a file this process
-reads is a file it has to hold, and a file it writes must never go through a
-name something else could have planted first.
+Standard library only. Every read has its ceiling at the read; every write is
+staged under an exclusively-created name and renamed into place.
 """
 
 import argparse
@@ -41,23 +35,13 @@ STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME")
                          or os.path.join(HOME, ".local/state"), "plug")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 CATALOG_FILE = os.path.join(STATE_DIR, "catalog.json")
-# Per-plugin update history: the commit an applied update came from (for
-# restore) and the last reviewed commit. Keeps its historic on-disk name so
-# bookkeeping recorded by earlier versions survives the upgrade.
+# Keeps its historic on-disk name so old bookkeeping survives the upgrade.
 HISTORY_FILE = os.path.join(STATE_DIR, "locks.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
+OUTCOME_FILE = os.path.join(STATE_DIR, "outcome.json")
 
-# The AI reviewer is the user's choice, so a published Plug does not assume
-# anyone has a particular tool. Two kinds are supported:
-#   type "cli"  — a command-line agent (Claude Code). Plug runs
-#                 it once, read-only, with the diff as the prompt.
-#   type "http" — a local server exposing an OpenAI-compatible API (Ollama, LM
-#                 Studio). Plug POSTs the diff to localhost, so the review runs
-#                 entirely on this machine and nothing leaves it.
-# GUI apps like ChatGPT Desktop or Grok Bot are not here: they are interactive
-# windows, not something Plug can call for a one-shot headless review. "none"
-# falls back to a plain-English reading of the offline scan, so the gate still
-# works with no AI at all.
+SELF_ID = "io.github.weedwhitesandwine.plug"
+
 AGENTS = {
     "claude": {
         "label": "Claude Code", "type": "cli", "bin": "claude",
@@ -78,70 +62,31 @@ AGENTS = {
 DEFAULT_SETTINGS = {"reviewAgent": "claude", "reviewModel": "sonnet",
                     "autoCheck": True}
 
-# The built catalog the marketplace website itself loads — one flat list of
-# every listed plugin with the card fields already resolved. (registry.json is
-# the raw multi-shape source; this is the baked result.)
 CATALOG_URL = ("https://raw.githubusercontent.com/HANCORE-linux/"
                "omarchy-plugin-marketplace/main/site/catalog.json")
 
-# Hitting the catalog ceiling is not something a user can fix from here, so
-# the message says what it actually takes: a build of Plug carrying a bigger
-# number. Silence, or a message about the network, would send them looking in
-# the wrong place for as long as they cared to look.
-def _too_big():
-    return ("the catalog is bigger than this version of Plug accepts (%d MB) "
-            "— it needs a newer Plug" % (MAX_REGISTRY_BYTES // (1024 * 1024)))
-
-# Ceilings. A plugin's own files are small; a repository that answers with
-# something orders of magnitude larger is not a plugin, and this can run on a
-# timer, so nothing over the ceiling is ever held.
-# The marketplace catalog is the one file here that grows on its own: it was
-# ~2 MB when this was first set and passed 2.8 MB inside a fortnight. The
-# protection is that a single known address is bounded at all, not the number,
-# so the number is set well clear of that growth rather than at the edge of it.
 MAX_REGISTRY_BYTES = 32 * 1024 * 1024
-# What this program is willing to WRITE as the saved catalog, as opposed to
-# what it is willing to read from the marketplace. It must not exceed the
-# ceiling the panel reads it back at (`catalogCeiling` in Panel.qml) — the two
-# were 32 MB and 8 MB, so a catalog between them was fetched, slimmed, written
-# and announced as updated, and then refused by the reader every time with the
-# Store showing nothing and saying nothing. A ceiling on the write is only a
-# ceiling if the reader agrees with it.
+# What is written as the saved catalog. Must not exceed the ceiling the panel
+# reads it back at, or the Store refuses its own file.
 MAX_CATALOG_BYTES = 8 * 1024 * 1024
 MAX_STATE_BYTES = 4 * 1024 * 1024
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_DIFF_BYTES = 512 * 1024
 MAX_SCAN_FILES = 400
-# Wall clock for one capability scan. Generous against any real plugin — the
-# largest installed here reads in a tenth of a second — and the point is not to
-# be tight, it is to exist at all.
 SCAN_DEADLINE = 20.0
 MAX_FINDINGS_PER_CLASS = 20
 GIT_TIMEOUT = 25
-# What any single git command may hand back. A diff has its own, larger
-# ceiling; everything else here is a sha, a ref or a short list.
 MAX_GIT_BYTES = 256 * 1024
-# What a candidate plugin's clone may occupy on disk. Checked while the clone
-# runs, so a repository that keeps growing is stopped rather than measured
-# afterwards.
 MAX_CLONE_BYTES = 64 * 1024 * 1024
-# Cloning a stranger's repository to read it: longer than a local git call,
-# short enough that a repository that will not answer does not hold the panel.
 CLONE_TIMEOUT = 90
 CLAUDE_TIMEOUT = 180
-# A reviewer's answer is a few paragraphs. This is the ceiling on what is read
-# back from one, whether it is a local command or a server on localhost: the
-# panel renders it inside a shell process that stays up for days, so a reply
-# that never stops must not be held whole on the way there.
 MAX_AGENT_BYTES = 512 * 1024
-# A prompt handed to a command as an argument has to fit in the operating
-# system's limit on arguments — about 128 KB for a single one. A diff big
-# enough to matter goes straight past that, and the review then fails and
-# falls back to the machine scan: the larger and more suspicious a change, the
-# weaker the check it would get. So the prompt goes in on standard input,
-# which has no such limit, and only an agent that cannot read standard input
-# gets a trimmed copy.
-MAX_PROMPT_ARG_BYTES = 96 * 1024
+MAX_SETTINGS_BYTES = 64 * 1024
+
+
+def _too_big():
+    return ("the catalog is bigger than this version of Plug accepts (%d MB) "
+            "— it needs a newer Plug" % (MAX_REGISTRY_BYTES // (1024 * 1024)))
 
 
 # --------------------------------------------------------------- hygiene
@@ -158,19 +103,10 @@ def ensure_state_dir():
 
 
 def read_capped(path, ceiling, follow=False):
-    """Read a file to a ceiling, non-blocking so a planted FIFO cannot hang.
-
-    Two kinds of file reach this, and they want opposite answers to a symlink.
-    Files Plug owns — its state, its settings, its bookkeeping — live in a
-    directory nobody else has any business linking through, so a link at one
-    of those names is not a dotfiles manager being helpful, it is something
-    redirecting a read: refuse it outright with O_NOFOLLOW. Files Plug merely
-    inspects, or that the user manages themselves, are legitimately symlinked
-    — shell.json into a chezmoi repository, a file inside somebody's plugin
-    checkout — so those resolve first and are then checked to be a real
-    regular file. O_NOFOLLOW only refuses a link as the last component, so a
-    plugin directory that is itself a symlink still reads fine either way.
-    """
+    """Read a regular file to a ceiling, non-blocking so a planted FIFO
+    cannot hang. follow=False refuses a symlink outright (files Plug owns);
+    follow=True resolves it first (files the user manages, or inspected
+    trees) and then requires a regular file."""
     real = os.path.realpath(path) if follow else path
     flags = os.O_RDONLY | os.O_NONBLOCK | (0 if follow else os.O_NOFOLLOW)
     fd = os.open(real, flags)
@@ -196,11 +132,9 @@ def read_json(path, ceiling, fallback, follow=False):
 
 
 def write_atomic(path, obj):
-    """Stage under an exclusively-created name in our own state directory,
-    then rename over the destination in one step."""
     ensure_state_dir()
     fd, tmp = tempfile.mkstemp(prefix=".plug.", suffix=".tmp",
-                              dir=os.path.dirname(path))
+                               dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(obj, f, separators=(",", ":"))
@@ -213,88 +147,88 @@ def write_atomic(path, obj):
         raise
 
 
+def run_capped(cmd, timeout, cap, env=None, cwd=None, stdin=None):
+    """Run one command with its stdout capped at the read: the output passes
+    through `head -c`, which closes the pipe at the ceiling so the child takes
+    SIGPIPE rather than filling memory here. stderr goes to a temporary file —
+    a pipe blocks the writer at 64 KB, and a chatty child then wedges behind
+    it until the timeout kills work that was going fine.
+
+    Returns (code, text, err, truncated). A truncated read reports code 0,
+    because head closing the pipe is what made the child exit non-zero."""
+    errfile = tempfile.TemporaryFile()
+    try:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile,
+                                    env=env, cwd=cwd,
+                                    stdin=(stdin if stdin is not None
+                                           else subprocess.DEVNULL))
+            try:
+                capper = subprocess.Popen(["head", "-c", str(cap)],
+                                          stdin=proc.stdout,
+                                          stdout=subprocess.PIPE)
+                proc.stdout.close()
+                try:
+                    out, _ = capper.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    capper.kill()
+                    out, _ = capper.communicate()
+                    raise
+                errfile.seek(0)
+                err = errfile.read(64 * 1024)
+            finally:
+                try:
+                    code = proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    code = proc.wait(timeout=5)
+            data = out or b""
+            # Bytes, not decoded characters: head cuts bytes, and a shorter
+            # decoded string would hide the cut.
+            truncated = len(data) >= cap
+            text = data.decode("utf-8", "replace")
+            if truncated:
+                code = 0
+            return (code, text.strip() if not truncated else text,
+                    (err or b"").decode("utf-8", "replace").strip(), truncated)
+        except (OSError, subprocess.SubprocessError):
+            return 1, "", "%s failed to run" % cmd[0], False
+    finally:
+        try:
+            errfile.close()
+        except OSError:
+            pass
+
+
+def last_line(text):
+    lines = [l for l in str(text or "").strip().split("\n") if l.strip()]
+    return lines[-1].strip() if lines else ""
+
+
 # --------------------------------------------------------------- git
 
-def git(dirpath, *args, timeout=GIT_TIMEOUT, cap=MAX_GIT_BYTES):
-    """The common form: the output, without the truncation flag."""
-    code, text, err, _ = git_capped(dirpath, *args, timeout=timeout, cap=cap)
-    return code, text, err
+GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def git_env():
+    return {**os.environ, **GIT_ENV, "HOME": HOME}
 
 
 def git_capped(dirpath, *args, timeout=GIT_TIMEOUT, cap=MAX_GIT_BYTES):
-    """Run one git command in a plugin directory with the repository's own
-    hooks and config kept out of the way — a plugin's checkout is untrusted,
-    and a hook or an -c alias must never run just because we inspected it.
-
-    Output is capped while it is being read, not after: the repository belongs
-    to somebody else, and a diff or a log it chooses to make enormous must not
-    be accumulated whole before anything gets to reject it."""
+    """One git command in a plugin's checkout with the repository's own hooks
+    and config kept out of the way — the checkout is untrusted, and a hook or
+    an alias must never run because we inspected it."""
     cmd = ["git", "-C", dirpath,
            "-c", "core.hooksPath=/dev/null",
            "-c", "protocol.ext.allow=never",
            "-c", "protocol.file.allow=user"]
     cmd += list(args)
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-           "GIT_CONFIG_NOSYSTEM": "1", "HOME": HOME}
-    # stderr goes to a temporary file rather than a pipe. A pipe holds 64 KB
-    # and then blocks the writer: a remote that talks a lot on stderr — a noisy
-    # fetch, a wall of hook warnings — filled it while this side was busy
-    # draining stdout, and git sat there unable to continue until the timeout
-    # killed a command that was working perfectly well. A file has no such
-    # limit, and it is read back to the same ceiling as before.
-    errfile = tempfile.TemporaryFile()
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=errfile, env=env)
-        try:
-            # `head -c` closes the pipe at the ceiling; git then takes SIGPIPE
-            # rather than filling memory here.
-            capper = subprocess.Popen(["head", "-c", str(cap)],
-                                      stdin=proc.stdout, stdout=subprocess.PIPE)
-            proc.stdout.close()
-            try:
-                out, _ = capper.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                capper.kill()
-                out, _ = capper.communicate()
-                raise
-            # Read from the file after the command has produced it, to the
-            # same ceiling the pipe used to impose.
-            errfile.seek(0)
-            err = errfile.read(64 * 1024)
-        finally:
-            # Wait first, kill only if it will not go. git's pipes reach EOF
-            # while it is still exiting, so killing unconditionally here could
-            # SIGKILL a command that had just succeeded and return -9 —
-            # which callers read as "not a git checkout" or "fetch failed".
-            try:
-                code = proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                code = proc.wait(timeout=5)
-        data = out or b""
-        # Measured in bytes, because `head -c` cuts bytes. Counting the
-        # characters they decode to is not the same number: any non-ASCII
-        # makes the string shorter than the cut, the cut goes unnoticed, git's
-        # kill status stands, and the diff comes back empty — which reads as
-        # "nothing changed". A single accented character in a large update was
-        # enough to have it approved as harmless.
-        truncated = len(data) >= cap
-        text = data.decode("utf-8", "replace")
-        if truncated:
-            code = 0
-        return (code, text.strip() if not truncated else text,
-                (err or b"").decode("utf-8", "replace").strip(), truncated)
-    except (OSError, subprocess.SubprocessError):
-        return 1, "", "git invocation failed", False
-    finally:
-        # Every path out of here, including the timeout that re-raises above.
-        # This program is a short-lived process, but it is also imported and
-        # called in a loop by `snapshot`, once per plugin per scan.
-        try:
-            errfile.close()
-        except OSError:
-            pass
+    return run_capped(cmd, timeout=timeout, cap=cap, env=git_env())
+
+
+def git(dirpath, *args, timeout=GIT_TIMEOUT, cap=MAX_GIT_BYTES):
+    code, text, err, _ = git_capped(dirpath, *args, timeout=timeout, cap=cap)
+    return code, text, err
 
 
 def is_git_repo(dirpath):
@@ -302,8 +236,6 @@ def is_git_repo(dirpath):
 
 
 def git_state(dirpath):
-    """Current commit, branch and its upstream tracking ref, and the remote
-    URL — everything needed to ask 'has upstream moved past what I have'."""
     out = {"isGit": is_git_repo(dirpath), "sha": "", "branch": "",
            "remote": "", "upstreamRef": ""}
     if not out["isGit"]:
@@ -318,8 +250,8 @@ def git_state(dirpath):
 
 
 def check_upstream(dirpath, st):
-    """Fetch origin and count how many commits upstream is ahead. This is the
-    one network step behind the update flag; everything else is offline."""
+    """Fetch origin and count how far behind HEAD is — the one network step
+    behind the update flag."""
     result = {"updateAvailable": False, "commitsBehind": 0, "upstreamSha": "",
               "fetchOk": False, "checkedAt": now_iso()}
     if not st.get("isGit") or not st.get("upstreamRef"):
@@ -342,30 +274,13 @@ def check_upstream(dirpath, st):
 
 
 def recount_behind(dirpath, row):
-    """Re-measure a carried-over update flag against where this checkout is
-    NOW, without touching the network.
-
-    The count in the state file was true when the check that produced it ran.
-    Applying an update moves HEAD and does not re-run that check, so the flag
-    outlived the thing it described: the row went on advertising an update that
-    had just been installed, with its button lit, until the next fetch — which
-    happens seconds later and on the far side of a shell restart. Every attempt
-    to paper over that in the panel decorated the stale answer instead of
-    correcting it.
-
-    Nothing here reaches the network. The upstream commit is already in the
-    object store, put there by the fetch that found it, so counting from HEAD
-    to it again is local and immediate. A missing or unreadable object means
-    the last answer is the best one available and is left alone.
-    """
+    """Re-measure a carried-over update flag against where the checkout is
+    now, offline — applying an update moves HEAD without re-running the
+    check, and the stale flag otherwise advertises the update just
+    installed."""
     ref = row.get("upstreamSha") or ""
     if not row.get("isGit") or not re.fullmatch(r"[0-9a-f]{40}", ref):
         return
-    # The answer for almost every row, without asking git anything: sitting on
-    # the exact commit the last check called upstream means nothing is behind.
-    # That covers both the plugin that was already current and the one whose
-    # update just landed — the case this exists for — and it keeps a scan that
-    # runs on every refresh from growing two subprocesses per plugin.
     if row.get("sha") == ref:
         row["commitsBehind"] = 0
         row["updateAvailable"] = False
@@ -381,71 +296,36 @@ def recount_behind(dirpath, row):
 
 
 def diff_text(dirpath, from_sha, to_ref):
-    """The incoming change, as unified diff text, capped. This is the exact
-    thing a human — or Claude — would need to read to judge an update."""
     code, out, _, truncated = git_capped(
         dirpath, "-c", "core.pager=cat", "diff", "--no-color",
         "%s..%s" % (from_sha, to_ref), cap=MAX_DIFF_BYTES)
     if code != 0:
         return ""
     if truncated:
-        # Say so in the text itself: the reviewer must not mistake a cut-off
-        # diff for a complete one, and the panel shows what it was given.
         out += ("\n\n[This update is larger than %d bytes. Everything above is "
                 "the first part of it; the rest was not read. Treat anything "
                 "you cannot see as unreviewed.]" % MAX_DIFF_BYTES)
     return out
 
 
-# --------------------------------------------------- deterministic scan
+# --------------------------------------------------- capability scan
+#
+# A deliberately blunt read of a plugin's source: which capability classes
+# appear, whether each line runs the thing or only displays it, and a trust
+# band with the reason spelled out. It never runs anything. The nuance
+# belongs to the AI reviewer; this only has to be honest.
 
-# One row per signal: class|severity|regex. This never runs a plugin; it only
-# reads the characters in its source. It is deliberately blunt — the point is
-# to hand Claude a structured list of "this plugin can reach the network / spawn
-# processes / touch these sensitive paths", not to decide anything itself.
-# Deliberately blunt, but tuned so an honest plugin does not light up on its
-# own comments. The literal path/secret tokens (.ssh, id_rsa, .env) stay; the
-# bare English words "password/secret" do not, because they are almost always
-# prose. atob/base64-decode/eval stay in obfuscation; fromCharCode and \xNN do
-# not, because keycode handling uses them all the time.
 PATTERN_ROWS = [
     ("network", "high", re.compile(r"XMLHttpRequest|\bfetch\(|WebSocket|\bSocket\b|\bcurl\b|\bwget\b|urllib|requests\.|https?://[a-zA-Z0-9.-]+\.[a-z]")),
     ("process", "medium", re.compile(r"execDetached|Process\s*\{|command:|subprocess|Popen|\bsh -c\b|\bbash -c\b")),
     ("fileWrite", "medium", re.compile(r"atomicWrites|\btee\b|\brm -rf?\b|>>\s*[\"'$/~]|os\.replace|shutil\.")),
     ("sensitive", "high", re.compile(r"\.ssh/|\.gnupg|\.aws|id_rsa|id_ed25519|/etc/(passwd|shadow|sudoers)|/root/|hosts\.yml|/\.env\b|Bitwarden|keyring|/proc/[0-9]")),
-    # systemctl only counts when it changes something. `is-active`, `status`
-    # and the other read-only verbs need no privilege at all, and treating a
-    # health check as an escalation was the loudest false alarm here.
-    #
-    # The flags are skipped rather than treated as the verb. Excluding anything
-    # starting with `--` was meant to skip `--version`, and instead skipped
-    # `systemctl --now enable` and every other mutating call that happened to
-    # carry a flag first. `--user` is not an escalation — it needs no
-    # privilege at all — so it goes to `install` below, which is where
-    # persistence belongs.
-    #
-    # The power verbs are not privilege either: logind grants suspend and
-    # hibernate to any active local session through polkit, no root and no
-    # prompt, so `systemctl suspend` runs exactly as far as the user's own
-    # power button does. Counting it had Ripcord's row reading "runs commands
-    # as root" over code that cannot reach root at all. (The lookahead
-    # excludes by prefix, so `suspend` also covers `suspend-then-hibernate`.)
-    # logind grants reboot and poweroff to an active session too, and they
-    # stay flagged anyway, deliberately: they end every session on the
-    # machine, which is worth a word on the row even when no root is
-    # involved — the wording overclaims there and the disruption underwrites
-    # it. Suspend is recoverable; poweroff is not.
+    # systemctl counts only when it changes something: the read-only verbs need
+    # no privilege, and logind grants suspend/hibernate to any local session.
     ("privilege", "high", re.compile(
         r"\bsudo\b|\bpkexec\b|\bdoas\b|\bpolkit\b"
         r"|systemctl\s+(?:--(?!user\b)[\w-]+\s+)*"
         r"(?!is-|status|show|list-|cat\b|help\b|suspend|hibernate|hybrid-sleep|--)[a-z]")),
-    # Installing software, and arranging for something to keep running. This
-    # is what a plugin's install-time script does, and none of the classes
-    # above see it: a package manager is not a privileged word, `cmake
-    # --install` is not a file write the pattern above recognises, and a user
-    # service needs no privilege while still starting at every login. A plugin
-    # that does any of this is doing something to the machine that outlives
-    # the plugin folder, and that is worth saying out loud.
     ("install", "high", re.compile(
         r"\bomarchy\s+pkg\s+(?:add|remove)\b"
         r"|\b(?:pacman|yay|paru|pamac)\s+-(?:S|R|U)"
@@ -459,134 +339,66 @@ PATTERN_ROWS = [
     ("obfuscation", "high", re.compile(r"atob\(|\bbase64 -d\b|base64 --decode|\beval\(|\bexec\(|\\u00[0-9a-fA-F]{2}\\u00")),
 ]
 
-# Three bands, not a number.
-#
-# A 0-100 score claimed a precision this scanner has never had. Nobody could
-# say what 44 meant, the weights behind it were invented, and comparing two
-# plugins by it compared two guesses. Worse, arithmetic hid the one thing that
-# actually matters: a plugin *displaying* the text "sudo systemctl enable" and
-# a plugin *running* sudo both moved the number, in the same direction, by an
-# amount that depended on how many times each did it.
-#
-# So the question is asked directly instead. Red is not "scored badly", it is
-# "this contains something obviously fishy", and it stays rare enough to mean
-# something when it appears. Amber is the honest middle: this reaches past
-# itself, and here is how. Green is squeaky clean.
 TRUST_RED, TRUST_AMBER, TRUST_GREEN = "red", "amber", "green"
 
-# Worth naming on the row whenever the code actually runs them: reading
-# somebody's keys, escalating, hiding what it does behind an encoder, or
-# driving a package manager while the shell is up.
+# Worth naming on the row when the code actually runs them.
 ALARMING = ("sensitive", "privilege", "obfuscation", "install")
-
-# The subset with no innocent explanation at all — virus-shaped, not merely
-# privileged. Running a command as root or a package manager is a capability
-# a legitimate plugin can hold and disclose (the marketplace lists several);
-# reading private keys or executing decoded blobs is not. Only these make a
-# plugin red, so red stays rare enough to mean "do not walk past this".
+# The subset with no innocent explanation at all — only these make red, so
+# red stays rare enough to mean "do not walk past this".
 HOSTILE = ("sensitive", "obfuscation")
-
-# Reaching off the machine is not alarming — most useful plugins do it — but
-# it is not squeaky clean either, and it is the difference between a plugin
-# that could leak something and one that could not.
 REACHES_OUT = ("network",)
 
-# Short enough to sit on a row next to a plugin's name.
 CAP_SHORT = {"sensitive": "private files", "privilege": "commands as root",
              "obfuscation": "hidden code", "install": "a package manager",
              "network": "the network", "process": "other programs",
              "fileWrite": "files"}
 
 
-def trust_why(hits, mentions, light):
-    """Why a plugin is not green, in a few words. A colour nobody can account
-    for is the thing that made the old number useless, so the reason travels
-    with the band and is never derived a second time at the panel."""
+def trust_band(hits, mentions):
+    if any(c in hits for c in HOSTILE):
+        return TRUST_RED
+    if any(c in hits or c in mentions for c in ALARMING + REACHES_OUT):
+        return TRUST_AMBER
+    return TRUST_GREEN
+
+
+def trust_why(hits, mentions, script_caps):
+    """The reason beside the band, in a few words — a colour nobody can
+    account for is worse than no colour."""
     why = []
     ran = [c for c in ALARMING if c in hits]
     if ran:
         why.append("runs " + ", ".join(CAP_SHORT.get(c, c) for c in ran))
     if any(c in hits or c in mentions for c in REACHES_OUT):
         why.append("reaches the network")
-    # A shipped script counts for what is in it, not for existing: a plugin's
-    # test harness is an unreferenced script too, and labelling Ripcord's
-    # tests an install step had the row asserting a setup ritual the README
-    # never asks for. Only a script that actually does setup-shaped things —
-    # a package manager, privilege, persistence — earns the words.
-    if any(c in light for c in ALARMING + REACHES_OUT):
+    if any(c in script_caps for c in ALARMING + REACHES_OUT):
         why.append("has a setup script")
-    # Only what the plugin displays. What a setup script does is already
-    # said by "has a setup script", and calling it "shows you a package
-    # manager" described the opposite of what that script does.
-    quoted = [c for c in ALARMING if c in mentions]
+    quoted = [c for c in ALARMING if c in mentions and c not in hits]
     if quoted:
         why.append("shows you " + ", ".join(CAP_SHORT.get(c, c) for c in quoted))
     return " · ".join(why)
 
 
-def trust_band(hits, mentions, light):
-    """Which of the three a plugin lands in, from what the scan found.
-
-    `hits` is code that runs, `mentions` are strings it only displays, and
-    `light` is what a script you would run by hand does. Run-versus-show still
-    decides the wording on the row, but only the HOSTILE subset decides red:
-    quoting `sudo systemctl enable` is a plugin being helpful, running it is a
-    plugin holding a capability worth naming, and reading `~/.ssh` is a plugin
-    nobody should install without reading."""
-    if any(c in hits for c in HOSTILE):
-        return TRUST_RED
-    ran_alarm = any(c in hits for c in ALARMING)
-    quoted_alarm = any(c in mentions or c in light for c in ALARMING)
-    reaches = any(c in hits or c in mentions for c in REACHES_OUT)
-    # A shipped script bands by its contents, never by existing: an
-    # unreferenced script with nothing alarming in it is a test harness, not
-    # an install step, and existence is not evidence. Its contents include
-    # the network — a setup step that downloads code is exactly the case the
-    # scan exists for — but not `process`, which every script would trip.
-    script_acts = any(c in light for c in ALARMING + REACHES_OUT)
-    if ran_alarm or quoted_alarm or reaches or script_acts:
-        return TRUST_AMBER
-    return TRUST_GREEN
-
-# Which line comment starts a comment, per file type. Block comments (/* */)
-# are handled for the C-style ones.
 LINE_COMMENT = {".qml": "//", ".js": "//", ".mjs": "//",
                 ".sh": "#", ".bash": "#", ".py": "#", ".lua": "--"}
 
-# A run of this many characters with nothing to break it up is what packed or
-# encoded content looks like. Long lines of comma-separated data — a coastline,
-# a lookup table — are long but never unbroken, and are not a smell.
+# An unbroken run this long is what packed or encoded content looks like.
 LONG_TOKEN = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
 
-# Something on this line actually runs a command. A privileged word inside a
-# string next to one of these is a command being run; the same word in a string
-# with none of them nearby is a plugin quoting a command — the line it puts on
-# your clipboard, or prints for you to type. Both are worth knowing about;
-# only one of them is the plugin exercising the privilege.
+# Something on this line actually runs a command; a privileged word in a
+# string with none of these nearby is the plugin quoting a command.
 EXEC_CONSTRUCT = re.compile(
     r"execDetached|Process\s*\{|command\s*:|subprocess|Popen|\brun\(|\bsystem\("
     r"|\bsh\s+-c\b|\bbash\s+-c\b")
-
-# Command substitution, which is execution in a shell and ordinary string
-# interpolation in QML or JavaScript. Asking the shell question of a QML
-# template literal marks a plugin down for formatting a string.
 SHELL_EXEC = re.compile(r"\$\(|`")
 SHELL_EXT = (".sh", ".bash")
 
 
-
-
 def split_line(line, lc, in_block):
-    """Split one source line into the part that executes and the strings it
-    contains, dropping comments entirely. Returns
-    (code, strings, in_block, without_comment) — the last being the line as
-    written with only the comment removed, quote characters and all, because
-    a backtick and a `$(` are themselves the evidence that a line runs
-    something and both are lost once the quoting is taken apart.
-
-    The scan reads characters, so without this it cannot tell a capability
-    being used from one being mentioned: a comment describing a poll, or the
-    instructions a panel prints, read exactly like the real thing."""
+    """Split a source line into executing code and its string literals,
+    dropping comments. Returns (code, strings, in_block, without_comment) —
+    the last keeps quote characters, because a backtick or `$(` is itself
+    the evidence a shell line runs something."""
     code = []
     strings = []
     buf = []
@@ -620,8 +432,8 @@ def split_line(line, lc, in_block):
             in_block = True
             i += 2
             continue
-        # A comment marker only starts a comment at the start of the line or
-        # after whitespace, so a URL fragment or ${#name} is left alone.
+        # A comment marker only counts at line start or after whitespace, so a
+        # URL fragment or ${#name} is left alone.
         if lc and line.startswith(lc, i) and (i == 0 or line[i - 1].isspace()):
             break
         if ch in "\"'`":
@@ -630,24 +442,15 @@ def split_line(line, lc, in_block):
             continue
         code.append(ch)
         i += 1
-    if quote:              # unterminated quote: keep what we read
+    if quote:
         strings.append("".join(buf))
     return "".join(code), strings, in_block, line[:i]
 
+
 SCAN_EXT = (".qml", ".js", ".sh", ".py", ".bash", ".lua", ".mjs")
 
-# A script does not need a suffix to run, and in a plugin the one that matters
-# most usually has none. `omarchy plugin add` clones a repository and runs
-# nothing in it, so a plugin whose real install needs more than a clone ships
-# that step as a plain `setup` or `install` file for you to run yourself.
-# Picking source files by suffix walked straight past exactly that file: the
-# one holding the package installs, the build and the service enablement was
-# the one file neither the scan nor the reviewer ever saw.
-#
-# So a file carrying no suffix at all is opened far enough to see whether it
-# begins with a shebang, and read as that language if it does. The peek is a
-# fixed 128 bytes and the number of peeks is capped, so a tree full of
-# extensionless files costs a bounded amount rather than a read each.
+# A file with no suffix is opened far enough to read its shebang — the file
+# that does the most to a machine is usually the one named plainly `setup`.
 SHEBANG_LANG = (
     (re.compile(r"^#!.*\b(?:bash|sh|zsh|dash|ksh)\b"), ".sh"),
     (re.compile(r"^#!.*\bpython[0-9.]*\b"), ".py"),
@@ -659,9 +462,6 @@ PEEK_BYTES = 128
 
 
 def peek_head(path, nbytes=PEEK_BYTES):
-    """The first bytes of a file, truncated rather than refused. Same opening
-    discipline as read_capped — no symlink, no FIFO, no blocking — but a large
-    file is exactly what a peek expects, so its size is not an error here."""
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -675,16 +475,10 @@ def peek_head(path, nbytes=PEEK_BYTES):
 
 
 def script_ext(path, budget=None):
-    """The language a file is written in, or "" if it is not source we read.
-    A known suffix answers outright; a file with no suffix is asked for a
-    shebang, against the shared peek budget."""
     low = path.lower()
     for ext in SCAN_EXT:
         if low.endswith(ext):
             return ext
-    # Only a file carrying no suffix at all is worth a peek. A `.png` or a
-    # `.md` is not a script that mislaid its extension, and a leading dot is
-    # part of the name rather than a suffix.
     if "." in os.path.basename(path).lstrip("."):
         return ""
     if budget is not None:
@@ -703,23 +497,14 @@ def script_ext(path, budget=None):
 
 
 def scan_files(root, only_files=None, skipped=None):
-    """Yield (relpath, text, ext) for source files under root, bounded so a
-    hostile tree cannot exhaust us. Non-regular files and symlinks are skipped.
-    `ext` is the language to read the file as, which for an extensionless
-    script is what its shebang said rather than what its name did.
-
-    Pass a list as `skipped` to be told what was left out. The bounds here are
-    the point of the function, but a caller that reports on what it read has to
-    know the reading was partial: without this the caps were invisible, and a
-    plugin could put its payload in a file too large to read and be described
-    as clean."""
+    """Yield (relpath, text, ext) for source files under root, bounded. Pass
+    `skipped` to learn what was left out — a partial read must never be
+    reported as a complete one."""
     count = 0
     picked = []
     budget = [MAX_PEEK_FILES]
     if only_files is not None:
         for p in only_files:
-            # A file named outright is scanned whatever it is called, the way
-            # it always was; the shebang only decides how to read it.
             picked.append((p, script_ext(p, budget)
                            or os.path.splitext(p)[1].lower() or ".sh"))
     else:
@@ -733,8 +518,6 @@ def scan_files(root, only_files=None, skipped=None):
                     picked.append((path, ext))
     for path, ext in picked:
         if count >= MAX_SCAN_FILES:
-            # More files than this reader will look at. Whoever asked needs to
-            # know the reading stopped short — see `skipped` below.
             if skipped is not None:
                 skipped.append("file count")
             break
@@ -745,12 +528,6 @@ def scan_files(root, only_files=None, skipped=None):
                 continue
             raw = read_capped(path, MAX_SOURCE_BYTES, follow=True)
         except OSError:
-            # A file too large to read is not a file that was read. This was
-            # silent, and silence here is the difference between "nothing
-            # alarming was found" and "nothing alarming was found in the parts
-            # that were looked at" — a 4 MB install script sailed through as a
-            # clean plugin, and was reported to the user as being 0 lines long
-            # while they were handed the command to run it.
             if skipped is not None:
                 skipped.append(os.path.relpath(path, root))
             continue
@@ -759,72 +536,37 @@ def scan_files(root, only_files=None, skipped=None):
         yield rel, raw.decode("utf-8", "replace"), ext
 
 
-def scan_plugin(dirpath, only_files=None, light_files=None):
-    """A capability read of a plugin's source. Returns the trust score, the
-    capabilities present, and a few example lines per class — the material
-    Claude is given, and a quick colour for the panel.
-
-    The dot answers "what does this do once it is running", and an install
-    script is not that: it is a step you take once, knowingly, after the panel
-    has printed its every line for you. Scoring it like runtime code sent a
-    plugin that talks to earbuds below Plug itself, which clones strangers'
-    repositories for a living — and any plugin needing a compiled daemon would
-    have gone the same way, so the colour would have marked a category rather
-    than a risk, and a signal that fires on a whole category is one people stop
-    reading. Findings inside a detected install script are therefore weighed
-    lightly and surfaced in words instead; findings in the plugin's own code
-    keep full weight, because a plugin running a package manager while the
-    shell is up is a different animal entirely."""
-    scan_deadline = time.monotonic() + SCAN_DEADLINE
-    if light_files is None:
-        light_files = set(install_script_names(dirpath, scan_deadline))
-    hits = {}          # class -> set of "rel:lineno" (unique lines)
-    mentions = {}      # class -> lines that only quote it, never run it
-    light = {}         # class -> lines inside an install script
-    examples = {}      # class -> list of {file, line, text}
-    # A deadline, because every other ceiling here bounds bytes and none of
-    # them bounds time. The clone is capped at 64 MB on disk, but 64 MB of
-    # source walked character by character is minutes of one core, and a
-    # repository can be built to be expensive to read rather than large. There
-    # was nothing to stop it: the panel could close, the review could be
-    # cancelled, and this loop would keep going. Checked per file rather than
-    # per line — a single pathological line is bounded by its own length, and a
-    # per-line clock call would cost more than it saves.
-    deadline = scan_deadline
+def scan_plugin(dirpath, only_files=None, install_files=None):
+    """The capability read behind the trust mark. `hits` is code that runs a
+    class, `mentions` are lines that only display it; findings inside a
+    detected install script are additionally tagged so the row can say "has a
+    setup script"."""
+    deadline = time.monotonic() + SCAN_DEADLINE
+    if install_files is None:
+        install_files = set(install_script_names(dirpath, deadline))
+    hits = {}
+    mentions = {}
+    script_caps = set()
+    examples = {}
     truncated = False
     skipped = []
     for rel, text, ext in scan_files(dirpath, only_files, skipped):
         if time.monotonic() > deadline:
-            # Stopping early is a fact about the scan, not a verdict on the
-            # plugin: whatever was found still counts, and the caller is told
-            # the reading was cut short so it can say so rather than present a
-            # partial read as a complete one.
             truncated = True
             break
         lc = LINE_COMMENT.get(ext, "#")
         shell = ext in SHELL_EXT
-        # Install scripts sit at the top level, so the name is the whole path.
-        in_install = rel in light_files
+        in_script = rel in install_files
         in_block = False
         for i, line in enumerate(text.split("\n"), 1):
             code, strings, in_block, uncommented = split_line(line, lc, in_block)
-            quoted = strings[0] if len(strings) == 1 else " ".join(strings)
+            quoted = " ".join(strings)
             key = "%s:%d" % (rel, i)
-            # Whether the line runs something is only asked once a pattern has
-            # matched, which is a small fraction of lines. In a shell file it
-            # is asked of the line as written, because a backtick is itself a
-            # quote character and `$(…)` sits inside double quotes — a line
-            # taken apart by its quoting no longer contains the marks that say
-            # it runs something.
             runs = None
             if len(line) > 2000 and LONG_TOKEN.search(line):
-                (light if in_install else hits) \
-                    .setdefault("obfuscation", set()).add(key)
-            # Nothing is ever suppressed: a string that is not executed is
-            # counted lightly, never dropped. Suppressing displayed text meant
-            # a call prefixed with `text:` or `title:` disappeared from the
-            # scan altogether, which is a worse fault than the false positive
-            # it was added to fix.
+                hits.setdefault("obfuscation", set()).add(key)
+                if in_script:
+                    script_caps.add("obfuscation")
             for cls, sev, rx in PATTERN_ROWS:
                 in_code = bool(rx.search(code))
                 if not in_code and not rx.search(quoted):
@@ -832,91 +574,61 @@ def scan_plugin(dirpath, only_files=None, light_files=None):
                 if runs is None:
                     runs = bool(EXEC_CONSTRUCT.search(code)
                                 or (shell and SHELL_EXEC.search(uncommented)))
-                # A quoted command the plugin does not run is a mention.
                 is_mention = not (in_code or runs)
-                bucket = (light if in_install
-                          else mentions if is_mention else hits)
+                bucket = mentions if is_mention else hits
                 seen = bucket.setdefault(cls, set())
                 if key in seen:
                     continue
                 seen.add(key)
+                if in_script:
+                    script_caps.add(cls)
                 ex = examples.setdefault(cls, [])
                 if len(ex) < MAX_FINDINGS_PER_CLASS:
                     ex.append({"file": rel, "line": i,
                                "quotedOnly": is_mention,
                                "text": line.strip()[:200]})
-    caps = sorted(set(hits) | set(mentions) | set(light))
-
-    # A reading that stopped early cannot say a plugin is clean, and green is
-    # exactly that claim. `trust_band` decides from what was FOUND, so a scan
-    # that ran out of clock before reaching the hostile file finds nothing and
-    # bands green — which turns the deadline above, added to stop a repository
-    # pegging a core, into a way to hide from the scan. Measured: a plugin
-    # whose helper runs `curl … | bash`, reads `~/.ssh` and calls `sudo` bands
-    # red on its own, and green once padded with 60 MB of ordinary source
-    # inside the clone ceiling.
-    #
-    # So an incomplete read is never green, and it says why. Amber rather than
-    # red because nothing bad was found — what is being reported is the reading,
-    # not the plugin. Every consumer copies the band and the reason, so
-    # correcting them here reaches all of them, including the ones that never
-    # learned this flag exists.
-    # Three ways a read can be incomplete, and all of them count: the clock ran
-    # out, a file was too large to read, or there were more files than this
-    # reader looks at. Only the first was covered when this was written, and the
-    # comment said "an incomplete read is never green" — which was false for the
-    # other two, and they are the easy ones to arrange. Measured: a 4 MB install
-    # script running `curl | bash`, reading `~/.ssh` and calling `sudo` banded
-    # green and was reported as being 0 lines long.
     if skipped:
         truncated = True
-    band = trust_band(hits, mentions, light)
-    why = trust_why(hits, mentions, light)
-    if truncated and band == "green":
-        band = "amber"
+    band = trust_band(hits, mentions)
+    why = trust_why(hits, mentions, script_caps)
+    # A reading that stopped early cannot claim a plugin is clean — padding a
+    # repository until the clock runs out must not earn a green.
+    if truncated and band == TRUST_GREEN:
+        band = TRUST_AMBER
         why = ("could not be read in full — it is large or slow enough to scan "
                "that the read was stopped, so this is not a clean bill")
     elif truncated:
         why = (why + " · and the read was stopped before the end").strip(" ·")
     return {"trustBand": band,
             "trustWhy": why,
-            "capabilities": caps,
+            "capabilities": sorted(set(hits) | set(mentions)),
             "scanTruncated": truncated,
             "examples": examples,
             "counts": {c: len(hits[c]) for c in hits},
             "quotedOnly": {c: len(mentions[c]) for c in mentions},
-            # Kept apart from `counts` so the reviewer, and anything else
-            # reading this, can tell "the plugin does X" from "a script you
-            # would run to install it does X".
-            "installScript": {c: len(light[c]) for c in light},
-            "hasInstallScript": bool(light_files)}
+            "hasInstallScript": bool(install_files)}
 
 
-# A step you run yourself, after the clone. `omarchy plugin add` copies files
-# and starts nothing, so a plugin needing packages, a compiled daemon or a
-# service ships a script at its root and tells you to run it. That script is
-# the whole install as far as your machine is concerned, and it is the part
-# Plug must never run for you — so it is read, described, and handed back.
+# A step the user runs by hand after the clone — `omarchy plugin add` copies
+# files and runs nothing, so a plugin needing packages, a build or a service
+# ships a script at its root. Plug reads it, describes it, and never runs it.
 INSTALL_SCRIPT_NAMES = re.compile(
     r"^(?:setup|install|bootstrap|postinstall|post-install|configure|build)"
     r"(?:\.(?:sh|bash|py))?$", re.I)
 MAX_INSTALL_SCRIPTS = 8
 MAX_INSTALL_STEPS = 12
-# A filename this program is willing to print into a command line for somebody
-# to paste. Nothing a shell treats as syntax: no quotes, backticks, dollars,
-# spaces, semicolons or slashes.
+# A filename safe to print into a command line: nothing a shell treats as
+# syntax.
 SAFE_SCRIPT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-# Only a language you would run from a shell. QML and JavaScript are the
-# plugin itself — the shell loads them, nobody executes them at a prompt — so
-# they are not install steps however they are named.
 INSTALL_EXT = (".sh", ".bash", ".py")
 
 
 def install_script_names(root, deadline=None):
-    """Just the names, without reading anything into a verdict — the scoring
-    needs to know which files these are before it can weigh them, and it
-    cannot ask install_scripts() for that without the two calling each other
-    in a circle."""
+    """Root-level scripts an install would leave for the user to run: a name
+    that says what it is, or a script nothing else in the plugin references.
+    Every qualifying script is returned whatever it is called — dropping an
+    awkward name would let the plugin choose whether its install step is
+    mentioned."""
     try:
         names = sorted(os.listdir(root))
     except OSError:
@@ -932,11 +644,6 @@ def install_script_names(root, deadline=None):
         scripts.append(name)
     if not scripts:
         return []
-    # What the rest of the plugin mentions by name. A script the plugin calls
-    # itself is machinery, not an install step.
-    # This walks every source file too, so it needs the same clock as the scan
-    # it runs ahead of — without one, a deadline set after this call measured
-    # nothing and a tarpit spent all its time here, before the timer started.
     referenced = set()
     for rel, text, _ in scan_files(root):
         if deadline is not None and time.monotonic() > deadline:
@@ -945,43 +652,23 @@ def install_script_names(root, deadline=None):
         for name in scripts:
             if name != base and name in text:
                 referenced.add(name)
-    # Every qualifying script is returned, whatever it is called. An earlier
-    # version of this dropped names that could not be safely printed, which
-    # handed the choice to the plugin: a root script called `post install.sh`
-    # vanished from the list, `hasInstallScript` went false with it, the
-    # "manual installation required" warning disappeared, and the ordinary
-    # Install button came back — while the file sat on disk after the install.
-    # The attacker picked the filename, so the attacker picked whether the
-    # warning appeared. Naming is decided here; printing is decided where the
-    # printing happens.
     return [n for n in scripts
             if INSTALL_SCRIPT_NAMES.match(n) or n not in referenced]
 
 
 def install_scripts(root, deadline=None):
-    """Scripts at the root of a plugin that an install would leave for the
-    user to run. Two things qualify one: a name that says what it is, or a
-    root-level script nothing else in the plugin ever calls — a control script
-    invoked from the QML is part of the running plugin, not part of installing
-    it. Each is reported with what the scan found inside it."""
+    """Each install script with what the scan found inside it, in the order
+    the lines run."""
     out = []
     for name in install_script_names(root, deadline):
-        named = bool(INSTALL_SCRIPT_NAMES.match(name))
-        # Scored at full weight here on purpose: this is the report on the
-        # script itself, where the whole point is to say what it does. The
-        # light weighting belongs to the plugin's trust mark, not to this.
         sc = scan_plugin(root, only_files=[os.path.join(root, name)],
-                         light_files=set())
+                         install_files=set())
         try:
             lines = len(read_capped(os.path.join(root, name),
                                     MAX_SOURCE_BYTES, follow=True)
                         .decode("utf-8", "replace").split("\n"))
         except OSError:
             lines = 0
-        # Every line the scan picked out, in the order they run, rather than
-        # only the install-class ones — what a script fetches and what it
-        # spawns is as much a part of "what running this would do" as what it
-        # installs, and reading them out of order reads as a different script.
         steps = []
         seen = set()
         for cls, items in sc["examples"].items():
@@ -994,17 +681,7 @@ def install_scripts(root, deadline=None):
                               "quotedOnly": it["quotedOnly"]})
         steps.sort(key=lambda s: s["line"])
         out.append({"file": name, "lines": lines,
-                    "byName": named,
-                    # Whether this name can go onto a command line for somebody
-                    # to paste. A name carrying quotes, spaces, backticks or a
-                    # dollar sign is still reported, still scanned and still
-                    # named on screen as plain text — it is simply not written
-                    # into a command, because doing so would be handing over a
-                    # command substitution to run.
-                    # fullmatch for the same reason the id uses it: `$` matches
-                    # before a trailing newline, and a newline is a legal
-                    # character in a filename. `setup.sh\n` would have been
-                    # called safe and then written onto a command line.
+                    "byName": bool(INSTALL_SCRIPT_NAMES.match(name)),
                     "safeName": bool(SAFE_SCRIPT_NAME.fullmatch(name)),
                     "does": sorted(sc["counts"].keys()),
                     "steps": steps[:MAX_INSTALL_STEPS]})
@@ -1019,15 +696,10 @@ def fetch_catalog_raw():
     req = urllib.request.Request(CATALOG_URL,
                                  headers={"User-Agent": "plug-omarchy-plugin/0.1"})
     with urllib.request.urlopen(req, timeout=30) as r:
-        # urllib follows redirects on its own, so the address that answered is
-        # not necessarily the one asked for. Check what actually replied: a
-        # redirect must not be able to walk this off https.
+        # urllib follows redirects on its own; a redirect must not walk this
+        # off https.
         if not str(getattr(r, "url", "") or CATALOG_URL).startswith("https://"):
             raise ValueError("a redirect took the catalog off https")
-        # What the server says it is about to send. It can be missing and it
-        # can be a lie, so the capped read below is still what enforces the
-        # ceiling; this only avoids pulling down megabytes of something that
-        # has already announced itself as too large.
         declared = r.headers.get("Content-Length")
         if declared and declared.strip().isdigit() \
                 and int(declared) > MAX_REGISTRY_BYTES:
@@ -1042,9 +714,8 @@ def fetch_catalog_raw():
 
 
 def build_catalog():
-    """Slim the marketplace's built catalog down to the card fields the Store
-    searches and shows. The full file is a couple of megabytes of validation
-    bookkeeping the panel never touches; this keeps only what a user sees."""
+    """Slim the marketplace catalog to the card fields the Store shows, and
+    trim it under the ceiling the panel reads it back at."""
     doc = fetch_catalog_raw()
     items = doc.get("plugins") if isinstance(doc, dict) else doc
     if not isinstance(items, list):
@@ -1053,11 +724,6 @@ def build_catalog():
     for c in items:
         if not isinstance(c, dict) or not c.get("id"):
             continue
-        # Keep community plugins and Omarchy's own built-ins, tagged so the
-        # Store can separate and badge them — the built-ins are shown for
-        # discovery, marked OFFICIAL, and never installed or managed by Plug
-        # (the shell owns those). Multi-plugin suites, which are neither a
-        # single installable plugin nor a built-in, are left out.
         stype = c.get("sourceType")
         official = stype == "builtin" or c.get("status") == "Built in"
         if not official and stype != "community":
@@ -1081,16 +747,8 @@ def build_catalog():
             "license": c.get("license", ""),
         })
     out.sort(key=lambda p: p["name"].lower())
-
-    # Trimmed to something the panel will actually read back, and told when it
-    # has been. Dropping from the end of a name-sorted list is arbitrary, but
-    # every alternative is too, and an arbitrary truncation the Store can
-    # describe beats a complete file the Store cannot open.
-    def sized(rows):
-        return {"fetchedAt": now_iso(), "count": len(rows), "plugins": rows,
-                "truncated": len(rows) < len(out)}
-
-    catalog = sized(out)
+    catalog = {"fetchedAt": now_iso(), "count": len(out), "plugins": out,
+               "truncated": False}
     kept = list(out)
     while kept and len(json.dumps(catalog, separators=(",", ":")).encode(
             "utf-8", "replace")) > MAX_CATALOG_BYTES:
@@ -1114,7 +772,7 @@ def load_history():
 
 
 def load_settings():
-    d = read_json(SETTINGS_FILE, 64 * 1024, {})
+    d = read_json(SETTINGS_FILE, MAX_SETTINGS_BYTES, {})
     s = dict(DEFAULT_SETTINGS)
     if isinstance(d, dict):
         for k in DEFAULT_SETTINGS:
@@ -1131,15 +789,12 @@ def http_get_json(url, timeout=1.5):
 
 
 def http_agent_models(spec):
-    """Ask a local server what models it has loaded. Returns [] if the server
-    is not running, which is how the panel knows not to offer it."""
     try:
         doc = http_get_json(spec["base"] + spec["models_path"])
     except Exception:
         return None
     models = []
     if isinstance(doc, dict):
-        # Ollama: {"models":[{"name":...}]}; LM Studio/OpenAI: {"data":[{"id":...}]}
         for m in (doc.get("models") or doc.get("data") or []):
             if isinstance(m, dict):
                 name = m.get("name") or m.get("id")
@@ -1153,41 +808,34 @@ def agent_available(agent_key):
     if not spec:
         return False
     if spec["type"] == "cli":
-        from shutil import which
-        return which(spec["bin"]) is not None
+        return shutil.which(spec["bin"]) is not None
     if spec["type"] == "http":
         return http_agent_models(spec) is not None
     return False
 
 
 def available_agents():
-    """Which reviewers are actually usable right now — CLIs that are installed
-    and local servers that are running. The panel offers only these, plus
-    'none', so a user never picks an agent they do not have. Local-server
-    models are read live from the server."""
+    """Only reviewers actually usable right now: installed CLIs and local
+    servers that answer."""
     out = []
     for key, spec in AGENTS.items():
         if spec["type"] == "cli":
-            from shutil import which
-            if which(spec["bin"]) is None:
+            if shutil.which(spec["bin"]) is None:
                 continue
             models = spec["models"]
             default = spec["default_model"]
-            entry = {"key": key, "label": spec["label"], "models": models,
-                     "defaultModel": default, "private": spec.get("private", False)}
         else:
             models = http_agent_models(spec)
             if models is None:
                 continue
             default = models[0] if models else ""
-            entry = {"key": key, "label": spec["label"], "models": models,
-                     "defaultModel": default, "private": spec.get("private", False)}
-        out.append(entry)
+        out.append({"key": key, "label": spec["label"], "models": models,
+                    "defaultModel": default,
+                    "private": spec.get("private", False)})
     return out
 
 
 def installed_ids():
-    """Every third-party plugin directory on disk, by its real manifest id."""
     out = {}
     try:
         entries = sorted(os.listdir(PLUGINS_DIR))
@@ -1204,15 +852,10 @@ def installed_ids():
 
 
 def shell_placements():
-    """Where each plugin sits in the shell config: on the bar, or in the list
-    of plugins loaded without a bar icon.
-
-    The shell calls a bar widget "enabled" only when it has a place in the bar,
-    so a plugin whose icon its owner has switched off reports as disabled while
-    still running perfectly well. Reading the config directly is the only way
-    to tell "switched off" from "loaded, icon hidden"."""
+    """Where each plugin sits in shell.json: on the bar, or loaded with its
+    icon hidden. The shell reports an icon-hidden bar widget as disabled, so
+    the config is the only way to tell "off" from "on, icon hidden"."""
     out = {}
-    # The user's own file, and a dotfiles manager legitimately symlinks it.
     d = read_json(os.path.join(HOME, ".config", "omarchy", "shell.json"),
                   4 * 1024 * 1024, {}, follow=True)
     if not isinstance(d, dict):
@@ -1237,9 +880,8 @@ def shell_placements():
 
 
 def snapshot(check_updates=False):
-    """Build the auxiliary state the panel joins onto the live plugin list:
-    git state, trust read, and the update flag. Offline unless asked to
-    check upstream."""
+    """Write state.json: git state, trust read and update flag per installed
+    plugin. Offline unless asked to check upstream."""
     prev = read_json(STATE_FILE, MAX_STATE_BYTES, {})
     prev_plugins = prev.get("plugins", {}) if isinstance(prev, dict) else {}
     hist = load_history()
@@ -1268,26 +910,18 @@ def snapshot(check_updates=False):
             "hasInstallScript": sc.get("hasInstallScript", False),
             "reviewedSha": hist.get(pid, {}).get("reviewedSha", ""),
             "previousSha": hist.get(pid, {}).get("previousSha", ""),
-            # Loaded, but with its bar icon switched off by its owner.
             "iconHidden": (placement.get(pid, {}).get("inPluginList", False)
                            and not placement.get(pid, {}).get("inBar", False)
                            and "bar-widget" in (m.get("kinds") or [])),
         }
-        # Carry the last known update result unless we are refreshing it now.
         old = prev_plugins.get(pid, {})
         for k in ("updateAvailable", "commitsBehind", "upstreamSha",
                   "checkedAt", "fetchOk"):
             if k in old:
                 row[k] = old[k]
         if check_updates:
-            up = check_upstream(dirpath, gs)
-            row.update(up)
+            row.update(check_upstream(dirpath, gs))
         else:
-            # Carried forward is not the same as still true. This is what lets
-            # the list tell the truth the moment an update lands, instead of at
-            # the next fetch. It costs nothing for a row already sitting on its
-            # recorded upstream — the overwhelming majority — and two local git
-            # calls for one that is genuinely behind.
             recount_behind(dirpath, row)
         plugins[pid] = row
     state = {"generatedAt": now_iso(), "pluginsDir": PLUGINS_DIR,
@@ -1296,33 +930,120 @@ def snapshot(check_updates=False):
     return state
 
 
-# --------------------------------------------------- Claude review
+# --------------------------------------------------- the panel's row list
 
-# What a reviewer is handed. It is about to read text a stranger wrote, with
-# the standing risk that some of that text is addressed to it rather than to
-# you, so it gets what it needs to run and to be itself and nothing else: the
-# credentials of the agent you picked, not of the two you did not, and none of
-# whatever else your shell happens to be carrying.
+# Core shell infrastructure with no meaningful switch, hidden from the
+# Official section.
+HIDDEN_FIRST_PARTY = {
+    "omarchy.bar", "omarchy.polkit", "omarchy.lock", "omarchy.idle",
+    "omarchy.notifications", "omarchy.osd", "omarchy.launcher", "omarchy.menu",
+    "omarchy.background", "omarchy.clipboard", "omarchy.image-picker",
+    "omarchy.spacer",
+}
+
+
+def live_plugins():
+    code, text, _, _ = run_capped(["omarchy-shell", "shell", "listPlugins"],
+                                  timeout=15, cap=MAX_STATE_BYTES)
+    if code != 0:
+        return None
+    try:
+        arr = json.loads(text)
+    except ValueError:
+        return None
+    return arr if isinstance(arr, list) else None
+
+
+def rows():
+    """The joined row list the panel renders: the shell's live plugin list
+    plus the engine's saved state, split into community and official. Fast —
+    nothing here scans or touches the network."""
+    live = live_plugins() or []
+    state = read_json(STATE_FILE, MAX_STATE_BYTES, {})
+    aux = state.get("plugins", {}) if isinstance(state, dict) else {}
+    if not isinstance(aux, dict):
+        aux = {}
+    hist = load_history()
+    placement = shell_placements()
+    community = []
+    official = []
+    for p in live:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        if not isinstance(pid, str) or not pid or pid == SELF_ID:
+            continue
+        kinds = p.get("kinds") if isinstance(p.get("kinds"), list) else []
+        if p.get("firstParty") is True:
+            if pid in HIDDEN_FIRST_PARTY or p.get("canDisable") is False:
+                continue
+            if "bar-widget" not in kinds:
+                continue
+            official.append({
+                "id": pid, "name": p.get("name") or pid, "official": True,
+                "kinds": ", ".join(kinds),
+                "enabled": p.get("enabled") is True, "canDisable": True,
+                "updateAvailable": False, "canRevert": False,
+                "iconHidden": False, "hasInstallScript": False,
+                "trustBand": "", "trustWhy": "", "capabilities": [],
+                "commitsBehind": 0,
+            })
+            continue
+        a = aux.get(pid) if isinstance(aux.get(pid), dict) else {}
+        # A bar widget whose owner hid its icon reports as disabled while
+        # running perfectly well: it is on, its icon is not.
+        icon_hidden = (placement.get(pid, {}).get("inPluginList", False)
+                       and not placement.get(pid, {}).get("inBar", False)
+                       and "bar-widget" in kinds)
+        community.append({
+            "id": pid,
+            "name": p.get("name") or a.get("name") or pid,
+            "author": a.get("author") or "",
+            "kinds": ", ".join(kinds),
+            "official": False,
+            "enabled": p.get("enabled") is True or icon_hidden,
+            "canDisable": p.get("canDisable") is not False,
+            "iconHidden": icon_hidden,
+            "hasInstallScript": a.get("hasInstallScript") is True,
+            "updateAvailable": a.get("updateAvailable") is True,
+            "commitsBehind": a.get("commitsBehind") or 0,
+            "trustBand": a.get("trustBand") or "",
+            "trustWhy": a.get("trustWhy") or "",
+            "capabilities": a.get("capabilities") or [],
+            "isGit": a.get("isGit") is True,
+            "remote": a.get("remote") or "",
+            "canRevert": bool(hist.get(pid, {}).get("previousSha")),
+        })
+    community.sort(key=lambda r: (not r["updateAvailable"], r["name"].lower()))
+    official.sort(key=lambda r: r["name"].lower())
+    return {"community": community, "official": official}
+
+
+# --------------------------------------------------- the AI review
+
+# The reviewer reads text a stranger wrote, so it gets what it needs to run
+# and nothing else: no XDG paths, no HOME of yours. Claude runs with a
+# throwaway home directory holding only its own settings, linked in.
 ENV_KEEP = frozenset((
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "LANG", "TZ",
-    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
-    "XDG_RUNTIME_DIR",
+    "PATH", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
 ))
-ENV_KEEP_PREFIXES = {
-    "claude": ("ANTHROPIC_", "CLAUDE_"),
-}
+CLAUDE_HOME_LINKS = (".claude", ".claude.json")
 
 
-def reviewer_env(agent, model=""):
-    keep = ENV_KEEP_PREFIXES.get(agent, ())
+def reviewer_env(workdir):
     env = {k: v for k, v in os.environ.items()
-           if k in ENV_KEEP or k.startswith("LC_") or k.startswith(keep)}
-    # Its own configuration and credentials live under the real home, so the
-    # home is the one thing that has to be right rather than merely present.
-    env["HOME"] = HOME
+           if k in ENV_KEEP or k.startswith("LC_")
+           or k.startswith(("ANTHROPIC_", "CLAUDE_"))}
+    fake = os.path.join(workdir, "home")
+    os.mkdir(fake, 0o700)
+    for name in CLAUDE_HOME_LINKS:
+        src = os.path.join(HOME, name)
+        if os.path.lexists(src):
+            os.symlink(src, os.path.join(fake, name))
+    env["HOME"] = fake
     return env
 
 
@@ -1363,7 +1084,6 @@ REVIEW_SYSTEM = (
     "it is exactly what a reviewer would stop on."
 )
 
-
 CAP_ENGLISH = {
     "network": "reach out over the internet",
     "process": "run other programs on your computer",
@@ -1376,18 +1096,10 @@ CAP_ENGLISH = {
 
 
 def offline_summary(diff, scan_facts, plugin_name, context="update"):
-    """When no AI reviewer is configured, still say something useful in plain
-    English from the offline scan alone. This is a fallback, not a verdict as
-    trustworthy as a real read of the diff — and it says so."""
+    """The no-AI fallback: plain English from the offline scan alone, saying
+    plainly that it is only a scan."""
     caps = scan_facts.get("capabilities", [])
-    # `capabilities` does not say whether a class was run or merely displayed,
-    # so it is the wrong thing to raise an alarm from — it read "this update
-    # involves privilege" for a plugin printing an install line on screen. The
-    # band has already drawn that distinction; use its answer.
     serious = [c for c in ALARMING if c in (scan_facts.get("runs") or {})]
-    # The same scan answers two different questions, and saying "this update"
-    # about a plugin that is not installed yet describes something that is not
-    # happening.
     install = context == "install"
     if install:
         changed = ["This plugin is not installed yet; %d bytes of its source "
@@ -1399,9 +1111,6 @@ def offline_summary(diff, scan_facts, plugin_name, context="update"):
         changed.append(("Once installed the plugin can: " if install
                         else "After the update the plugin can: ")
                        + "; ".join(CAP_ENGLISH.get(c, c) for c in caps) + ".")
-    # The offline scan cannot read a script, but it can say one is there and
-    # what class of thing the scan found in it. Without this the fallback
-    # verdict is silent about the only part that runs before anything else.
     for s in scan_facts.get("installScripts", []) or []:
         does = "; ".join(CAP_ENGLISH.get(c, c) for c in s.get("does", []))
         changed.append(
@@ -1410,9 +1119,6 @@ def offline_summary(diff, scan_facts, plugin_name, context="update"):
             % (s.get("file", "a script"), s.get("lines", 0),
                " — it can " + does if does else ""))
     if serious:
-        # Code that runs one of these has no innocent reading, which is the
-        # whole definition of the red band — so the fallback says DANGER
-        # rather than hedging at CAUTION and leaving Enter armed.
         verdict = ("DANGER" if scan_facts.get("trustBand") == TRUST_RED
                    else "CAUTION")
         headline = (("This plugin would " if install else "This update involves ") +
@@ -1431,8 +1137,8 @@ def offline_summary(diff, scan_facts, plugin_name, context="update"):
 
 
 def openai_chat(base, model, system, user):
-    """One-shot chat against a local OpenAI-compatible server (Ollama, LM
-    Studio). Returns the reply text. Bounded read; runs on localhost only."""
+    """One-shot chat against a local OpenAI-compatible server. Bounded read;
+    localhost only."""
     body = json.dumps({
         "model": model or "",
         "messages": [{"role": "system", "content": system},
@@ -1445,7 +1151,6 @@ def openai_chat(base, model, system, user):
         headers={"Content-Type": "application/json",
                  "User-Agent": "plug/0.1"})
     with urllib.request.urlopen(req, timeout=CLAUDE_TIMEOUT) as r:
-        # One byte over the ceiling is what identifies an oversized reply.
         raw = r.read(MAX_AGENT_BYTES + 1)
     if len(raw) > MAX_AGENT_BYTES:
         raise ValueError("reviewer replied with more than %d bytes" % MAX_AGENT_BYTES)
@@ -1457,34 +1162,12 @@ def openai_chat(base, model, system, user):
     return ""
 
 
-def truncate_bytes(text, limit, note):
-    """Cut text to a budget measured in bytes — the unit every limit here is
-    actually expressed in — and say in the text itself that it was cut."""
-    data = text.encode("utf-8")
-    if len(data) <= limit:
-        return text
-    room = max(0, limit - len(note.encode("utf-8")))
-    return data[:room].decode("utf-8", "ignore") + note
-
-
-def arg_prompt(text):
-    """A prompt that has to travel as a command-line argument, trimmed to fit
-    the operating system's limit and told plainly that it was trimmed. Without
-    this the command fails outright on a large change and the review quietly
-    degrades to the machine scan."""
-    return truncate_bytes(
-        text, MAX_PROMPT_ARG_BYTES,
-        "\n\n[Cut off here: this change is too large to hand to this "
-        "reviewer in one piece. Everything beyond this point is "
-        "unreviewed — say so in WATCH FOR.]")
-
-
 def run_agent(diff, scan_facts, plugin_name, context="update",
               install_steps=None):
-    """Hand the diff to the user's chosen AI reviewer, read-only, and get a
-    plain-English verdict back. Structurally read-only: the agent runs with no
-    tools and in an empty working directory, so the untrusted diff it reads
-    cannot become an instruction that touches this machine — it is data."""
+    """Hand the code to the chosen reviewer and get a plain-English verdict.
+    Structurally read-only: Claude runs with no tools, in an empty working
+    directory, under a throwaway home — the untrusted text it reads has
+    nothing to act with."""
     if not diff.strip():
         if context == "install":
             return {"verdict": "CAUTION",
@@ -1507,11 +1190,6 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
         return offline_summary(diff, scan_facts, plugin_name, context)
 
     if context == "install":
-        # A plugin whose install needs a step the user runs by hand is the
-        # case where the reviewer's answer matters most and is easiest to get
-        # wrong: the QML is inert until the shell loads it, while the script
-        # runs as the user the moment it is started. Name the files so the
-        # verdict is about them and not only about the plugin's own code.
         step_note = ""
         if install_steps:
             step_note = (
@@ -1546,71 +1224,37 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
     spec = AGENTS.get(agent, {})
     try:
         if spec.get("type") == "http":
-            # A local OpenAI-compatible server — the review never leaves the
-            # machine. Standard chat-completions shape works for Ollama and
-            # LM Studio alike.
             raw = openai_chat(spec["base"], model, REVIEW_SYSTEM, prompt)
-        else:
-            stdin_text = None
-            if agent == "claude":
-                cmd = ["claude", "-p", "--allowedTools", "",
-                       "--permission-mode", "plan",
-                       "--append-system-prompt", REVIEW_SYSTEM]
-                if model:
-                    cmd += ["--model", model]
-                # On standard input, so the size of the change cannot decide
-                # whether it gets reviewed.
-                stdin_text = prompt
-            else:
-                return offline_summary(diff, scan_facts, plugin_name, context)
-
+        elif agent == "claude":
+            cmd = ["claude", "-p", "--allowedTools", "",
+                   "--permission-mode", "plan",
+                   "--append-system-prompt", REVIEW_SYSTEM]
+            if model:
+                cmd += ["--model", model]
             empty = tempfile.mkdtemp(prefix="plug-review-")
             try:
-                # The ceiling goes at the read, not after it: the agent's
-                # output passes through `head -c`, which stops the pipe at the
-                # limit rather than letting an endless reply accumulate here.
-                stdin_file = None
-                if stdin_text is not None:
-                    fd, tmp_prompt = tempfile.mkstemp(prefix=".plug-prompt.",
-                                                      dir=empty)
-                    with os.fdopen(fd, "w") as f:
-                        f.write(stdin_text)
-                    stdin_file = open(tmp_prompt, "rb")
-                    os.unlink(tmp_prompt)
-                proc = subprocess.Popen(
-                    cmd, stdin=(stdin_file or subprocess.DEVNULL),
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    cwd=empty, env=reviewer_env(agent, model))
-                if stdin_file is not None:
-                    stdin_file.close()
+                env = reviewer_env(empty)
+                # The prompt goes in on standard input, so the size of a
+                # change cannot decide whether it gets reviewed.
+                fd, tmp_prompt = tempfile.mkstemp(prefix=".plug-prompt.",
+                                                  dir=empty)
+                with os.fdopen(fd, "w") as f:
+                    f.write(prompt)
+                stdin_file = open(tmp_prompt, "rb")
+                os.unlink(tmp_prompt)
                 try:
-                    capper = subprocess.Popen(
-                        ["head", "-c", str(MAX_AGENT_BYTES)],
-                        stdin=proc.stdout, stdout=subprocess.PIPE)
-                    proc.stdout.close()
-                    try:
-                        out, _ = capper.communicate(timeout=CLAUDE_TIMEOUT)
-                    except subprocess.TimeoutExpired:
-                        capper.kill()
-                        # Bounded: head already stopped the pipe at the
-                        # ceiling, so this only drains what it let through.
-                        out, _ = capper.communicate()
-                        raise
+                    code, raw, _, _ = run_capped(
+                        cmd, timeout=CLAUDE_TIMEOUT, cap=MAX_AGENT_BYTES,
+                        env=env, cwd=empty, stdin=stdin_file)
                 finally:
-                    if proc.poll() is None:
-                        proc.kill()
-                    proc.wait(timeout=5)
-                raw = (out or b"").decode("utf-8", "replace").strip()
+                    stdin_file.close()
+                raw = raw.strip()
             finally:
-                # rmdir only removes an empty directory, and this one is handed
-                # to an agent as its working directory — anything it chose to
-                # write there made the removal fail silently and left the
-                # directory behind for good. It is ours, we made it, and we are
-                # the last to want it.
                 shutil.rmtree(empty, ignore_errors=True)
+        else:
+            return offline_summary(diff, scan_facts, plugin_name, context)
     except (OSError, subprocess.SubprocessError, urllib.error.URLError,
             ValueError) as e:
-        # If the chosen agent fails, do not leave the user with nothing.
         fb = offline_summary(diff, scan_facts, plugin_name, context)
         fb["watchFor"] = "The AI reviewer (%s) could not run: %s. %s" % (
             agent, e, fb["watchFor"])
@@ -1618,8 +1262,6 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
     parsed = parse_review(raw)
     parsed["agent"] = agent
     if not parsed["ok"]:
-        # Agent ran but produced nothing parseable — fall back rather than
-        # show an empty verdict.
         fb = offline_summary(diff, scan_facts, plugin_name, context)
         fb["raw"] = raw
         return fb
@@ -1653,8 +1295,7 @@ def parse_review(raw):
             changed.append(s.lstrip("-*• ").strip())
         elif section == "watch" and s:
             watch = (watch + " " + s).strip()
-    # Every one of these is rendered in the panel, so each is capped on the way
-    # out as well as on the way in.
+    # Rendered in the panel, so capped on the way out as well as in.
     return {"verdict": verdict,
             "headline": (headline or "(no headline)")[:300],
             "whatChanged": [c[:400] for c in changed[:8]],
@@ -1663,20 +1304,17 @@ def parse_review(raw):
 
 
 def scan_tree_at(dirpath, ref):
-    """The capability read of a checkout as it would be AFTER moving to `ref`,
-    taken from a throwaway extraction of that tree so nothing on disk moves.
-    Returns None if the tree could not be extracted, and the caller falls back
-    to what is installed rather than reporting nothing."""
+    """Scan the checkout as it would be AFTER moving to ref, from a throwaway
+    extraction, so the reviewer judges the incoming code rather than the
+    installed code."""
     tmp = tempfile.mkdtemp(prefix="plug-tree-")
     try:
         cmd = ["git", "-C", dirpath,
                "-c", "core.hooksPath=/dev/null",
                "archive", "--format=tar", ref]
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-               "GIT_CONFIG_NOSYSTEM": "1", "HOME": HOME}
         try:
             git_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, env=env)
+                                        stderr=subprocess.DEVNULL, env=git_env())
             tar = subprocess.Popen(["tar", "-x", "-C", tmp],
                                    stdin=git_proc.stdout,
                                    stdout=subprocess.DEVNULL,
@@ -1698,8 +1336,8 @@ def scan_tree_at(dirpath, ref):
 
 
 def review(pid):
-    """Fetch the incoming changes for one plugin, scan them, and get Claude's
-    plain-English read. Writes review-<id>.json for the panel."""
+    """Fetch one plugin's incoming changes, scan them, get the reviewer's
+    read, and record which two commits it was read between."""
     inv = installed_ids()
     if pid not in inv:
         return {"error": "not installed: %s" % pid}
@@ -1713,22 +1351,13 @@ def review(pid):
         return {"error": "could not reach the plugin's repository"}
     to_ref = gs["upstreamRef"]
     diff = diff_text(dirpath, "HEAD", to_ref)
-    # The author's own words for what changed — the commit subjects — shown
-    # next to the AI's read so the user sees both.
     _, logtext, _ = git(dirpath, "log", "--no-merges", "--format=%s",
                         "HEAD..%s" % to_ref)
     changelog = [l.strip() for l in logtext.split("\n") if l.strip()][:20]
-    # Scan the code the update would install, not the code already installed.
-    # The prompt calls this "what the updated plugin can do", and it was the
-    # working tree at HEAD — so an update that newly reaches for ~/.ssh or
-    # pipes a download into a shell was described to the reviewer as having no
-    # capabilities at all, next to a trust score belonging to the old version.
     scan = scan_tree_at(dirpath, to_ref) or scan_plugin(dirpath)
     facts = {"trustBand": scan["trustBand"],
              "trustWhy": scan["trustWhy"],
              "capabilities": scan["capabilities"],
-             # Told apart so the reviewer knows which of these the plugin
-             # actually does and which it only quotes in its own text.
              "runs": scan.get("counts", {}),
              "quotedOnly": scan.get("quotedOnly", {}),
              "commitsBehind": up["commitsBehind"]}
@@ -1741,52 +1370,24 @@ def review(pid):
     return out
 
 
-# A plugin repository address, checked before git is ever pointed at it. The
-# catalog comes off the internet, so its addresses are data: only plain https
-# to a host and path, nothing that could name a local path or another
-# protocol.
+# Only plain https to a host and path — a catalog entry must not be able to
+# name a local path or another protocol.
 REPO_URL_RE = re.compile(
     r"^https://[A-Za-z0-9._~-]+(\.[A-Za-z0-9._~-]+)+(/[A-Za-z0-9._~%/-]*)?$")
 
-# A plugin id, checked the moment it is read out of a stranger's manifest.
-#
-# manifest.json is the one file in a candidate that neither half of the gate
-# looks at: it is not in SCAN_EXT, so the capability scan never reads it, and
-# it is not in the source listing, so the reviewer is never shown it. Its `id`
-# was nonetheless taken verbatim and interpolated into the command lines the
-# manual-install card puts on the clipboard — so a repository shipping a
-# harmless `setup.sh` (which is what forces that card to appear) and an id of
-# `x/$(…)` produced a clipboard line that ran the substitution when pasted.
-# The one file the review cannot see was the one carrying the payload, on the
-# screen whose entire message is "this was read, now run these".
-#
-# Same shape omarchy itself requires of a plugin directory: a reverse-DNS-ish
-# name, no separators, no traversal, nothing a shell would look at twice.
 PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def valid_plugin_id(pid):
-    """True for an id safe to use as a directory name and as an argument.
-
-    Refused rather than escaped: an id has exactly one legitimate shape, and a
-    value outside it is not an id that needs careful quoting, it is input with
-    no business existing.
-    """
-    # fullmatch, not match. `$` matches before a trailing newline, so `match`
-    # accepted "abc\n" — and that id goes into the command lines the manual
-    # card offers for copying, where the newline splits the pinning line in two
-    # and the `git checkout` to the reviewed commit silently never runs. The
-    # validator would have been the thing that broke the guarantee it exists to
-    # protect.
+    """An id safe to use as a directory name and an argument. Refused rather
+    than escaped; fullmatch, because `$` matches before a trailing newline."""
     return (bool(pid) and pid == pid.strip()
             and bool(PLUGIN_ID_RE.fullmatch(pid)) and ".." not in pid)
 
 
 def source_listing(root_dir, limit=MAX_DIFF_BYTES):
-    """Every source file in a candidate plugin, concatenated with headers, so
-    a reviewer sees the whole thing rather than a change to it. Capped, and
-    the cap is stated in the text so nobody is misled about having read it
-    all."""
+    """Every source file in a candidate, concatenated with headers, capped,
+    with the cap stated in the text."""
     parts = []
     total = 0
     for rel, text, _ in scan_files(root_dir):
@@ -1802,8 +1403,6 @@ def source_listing(root_dir, limit=MAX_DIFF_BYTES):
 
 
 def dir_bytes(path, ceiling):
-    """Size of a directory tree, stopping as soon as it passes the ceiling —
-    there is no reason to finish counting something already too big."""
     total = 0
     for root, dirs, files in os.walk(path):
         for name in files:
@@ -1817,19 +1416,17 @@ def dir_bytes(path, ceiling):
 
 
 def clone_bounded(workdir, url, dest, ceiling=MAX_CLONE_BYTES):
-    """Clone a stranger's repository with a ceiling on what it may put on the
-    disk, enforced while it arrives. Returns (code, error)."""
+    """Clone a stranger's repository with the disk ceiling enforced while it
+    arrives, not measured afterwards."""
     cmd = ["git", "-C", workdir,
            "-c", "core.hooksPath=/dev/null",
            "-c", "protocol.ext.allow=never",
            "-c", "protocol.file.allow=user",
            "clone", "--depth", "1", "--no-tags", "--single-branch",
            "--", url, dest]
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-           "GIT_CONFIG_NOSYSTEM": "1", "HOME": HOME}
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, env=env)
+                                stderr=subprocess.PIPE, env=git_env())
     except OSError:
         return 1, "git invocation failed"
     deadline = time.time() + CLONE_TIMEOUT
@@ -1853,8 +1450,7 @@ def clone_bounded(workdir, url, dest, ceiling=MAX_CLONE_BYTES):
 
 
 def remote_head(url, ref="HEAD"):
-    """What the repository is at right now, asked without downloading it.
-    Returns the commit id, or "" if the question could not be answered."""
+    """What the repository is at right now, without downloading it."""
     if not REPO_URL_RE.match(str(url or "")):
         return ""
     code, out, _ = git(HOME, "ls-remote", "--", url, ref, cap=64 * 1024)
@@ -1868,9 +1464,8 @@ def remote_head(url, ref="HEAD"):
 
 
 def inspect_repo(url):
-    """Read a plugin BEFORE it is installed: clone it to a throwaway
-    directory, scan what it can do, and get a plain-English verdict on the
-    whole source. Nothing in the clone is ever run, and the clone is removed
+    """Read a plugin BEFORE it is installed: throwaway shallow clone, scan,
+    full-source review. Nothing in the clone is ever run, and it is deleted
     whether the read succeeds or not."""
     url = str(url or "").strip()
     if len(url) > 300 or not REPO_URL_RE.match(url):
@@ -1878,11 +1473,6 @@ def inspect_repo(url):
     tmp = tempfile.mkdtemp(prefix="plug-inspect-")
     try:
         dest = os.path.join(tmp, "src")
-        # A shallow clone with no tags: enough to read, as little as possible
-        # fetched. Hooks and alternate protocols are already disabled in git().
-        # The size is watched while it arrives — a repository that keeps
-        # growing is stopped mid-clone, not measured once it has filled the
-        # disk.
         code, err = clone_bounded(tmp, url, dest)
         if code != 0:
             return {"error": (err or "could not clone the repository").strip().split("\n")[-1]}
@@ -1890,27 +1480,19 @@ def inspect_repo(url):
         if not isinstance(manifest, dict):
             manifest = {}
         name = manifest.get("name") or url.rstrip("/").split("/")[-1]
-        # A manifest whose id is not an id is not a plugin. Refusing here is
-        # what keeps the value out of the manual-install commands downstream,
-        # and `isPlugin: false` is already the panel's word for "this cannot be
-        # installed as a plugin" — it hides the install button and says so.
+        # The manifest is the one file the scan does not read, and its id ends
+        # up in the manual-install commands — an id that is not an id is
+        # refused here, which also hides the install button.
         pid = manifest.get("id", "")
         if not isinstance(pid, str) or not valid_plugin_id(pid):
             pid = ""
         scan = scan_plugin(dest)
-        # On the same clock. Without a deadline this walks the whole tree again
-        # after the bounded scan has just finished, which is the gap the first
-        # attempt at that deadline fell into.
         steps = install_scripts(dest, time.monotonic() + SCAN_DEADLINE)
         facts = {"trustBand": scan["trustBand"],
-             "trustWhy": scan["trustWhy"],
+                 "trustWhy": scan["trustWhy"],
                  "capabilities": scan["capabilities"],
                  "runs": scan.get("counts", {}),
                  "quotedOnly": scan.get("quotedOnly", {}),
-                 # Kept apart so the reviewer is not told that the plugin
-                 # itself installs packages when what installs them is a
-                 # script the user runs once, by hand.
-                 "installScriptRuns": scan.get("installScript", {}),
                  "declaredKinds": manifest.get("kinds", []),
                  "installScripts": steps}
         listing = source_listing(dest)
@@ -1918,9 +1500,6 @@ def inspect_repo(url):
                             install_steps=steps)
         _, sha, _ = git(dest, "rev-parse", "HEAD")
         return {"url": url, "id": pid, "name": name, "sha": sha,
-                # A repository with no manifest is not an Omarchy plugin, and
-                # saying so is more use than a verdict on code that could
-                # never be installed.
                 "isPlugin": bool(pid),
                 "manualInstall": {"required": bool(steps), "scripts": steps},
                 "generatedAt": now_iso(), "review": verdict,
@@ -1945,10 +1524,9 @@ def safe_id(pid):
 # --------------------------------------------------- apply / rollback
 
 def apply_update(pid):
-    """Move a plugin to the commit that was reviewed — that exact commit, not
-    wherever its branch has reached since. The review recorded which commit it
-    was reading; anything else here is a different piece of code than the one
-    the user approved, so it is refused rather than applied."""
+    """Move a plugin to the exact commit that was reviewed — anything else is
+    a different piece of code than the one the user approved, and is refused
+    rather than applied."""
     inv = installed_ids()
     if pid not in inv:
         return {"error": "not installed"}
@@ -1967,20 +1545,10 @@ def apply_update(pid):
     before = gs["sha"]
     if from_sha and from_sha != before:
         return {"error": "this plugin has moved since it was reviewed — review it again"}
-    # Going where we already are is not an update, and letting it through cost
-    # the user the one thing this function exists to protect. Every check below
-    # passes for it — a commit is an ancestor of itself, and a fast-forward
-    # merge onto the commit already checked out succeeds and changes nothing —
-    # so the run reached the bookkeeping and recorded `previousSha = before`,
-    # which by then was the commit just installed. The version the user came
-    # from was overwritten with the version they were on, restore became a
-    # no-op, and nothing said so. Reachable without doing anything unusual:
-    # after an update the panel highlights the row it acted on, and reviewing
-    # that row again produces a review whose from and to are the same commit.
+    # Applying the commit already checked out would record previousSha as the
+    # commit itself and quietly turn restore into a no-op.
     if to_sha == before:
         return {"error": "already at the reviewed version — nothing to apply"}
-    # The reviewed commit has to be a real commit in this checkout, and it has
-    # to be ahead of where we are. Both are checked before anything moves.
     code, kind, _ = git(dirpath, "cat-file", "-t", to_sha)
     if code != 0 or kind != "commit":
         return {"error": "the reviewed version is no longer in the repository — review it again"}
@@ -1996,7 +1564,6 @@ def apply_update(pid):
     hist = load_history()
     entry = hist.get(pid, {})
     entry["reviewedSha"] = newsha
-    # Remember where we came from, so a bad update can be rolled back.
     entry["previousSha"] = before
     hist[pid] = entry
     write_atomic(HISTORY_FILE, hist)
@@ -2004,21 +1571,15 @@ def apply_update(pid):
 
 
 def rollback(pid):
-    """Undo the last update Plug applied, returning the plugin to the commit
-    it was on before. The version to return to was recorded at apply time."""
+    """Undo the last update Plug applied. The recorded target must be a
+    commit id, not a name git would resolve — a restored backup naming
+    `origin/main` would otherwise move the plugin to unreviewed HEAD."""
     inv = installed_ids()
     if pid not in inv:
         return {"error": "not installed"}
     prev = load_history().get(pid, {}).get("previousSha")
     if not prev:
         return {"error": "no earlier version recorded to roll back to"}
-    # A commit, not a name for one. `apply_update` validates its target two
-    # functions above and this did not, so the string went from Plug's own
-    # state file straight into `git reset --hard` — and a restored or edited
-    # backup of that file could name anything git resolves. `origin/main`
-    # would have moved the plugin to unreviewed upstream HEAD and recorded it
-    # as the reviewed version, which is the promise inverted: restore is the
-    # button you press when an update went wrong.
     if not re.fullmatch(r"[0-9a-f]{40}", str(prev)):
         return {"error": "the recorded earlier version is not a commit — refusing to roll back"}
     dirpath = inv[pid]["dir"]
@@ -2030,76 +1591,355 @@ def rollback(pid):
     hist = load_history()
     entry = hist.get(pid, {})
     entry["reviewedSha"] = prev
-    entry.pop("previousSha", None)   # one step back; nothing further recorded
+    entry.pop("previousSha", None)
     hist[pid] = entry
     write_atomic(HISTORY_FILE, hist)
     return {"ok": True, "id": pid, "sha": prev}
 
 
-# --------------------------------------------------- cli
-
 def forget(pid):
-    """Drop everything this manager remembers about a plugin it has removed.
-
-    This lived as an inline script in the control script and reimplemented
-    three helpers that already exist here — a reader with no ceiling and no
-    refusal of links or FIFOs, a stage file at a predictable name that a
-    planted symlink turns into the truncation of somebody else's file, and a
-    copy of safe_id that dropped the hash disambiguating two ids that clean
-    up to the same stem. Written once, in the file that already had all
-    three right.
-    """
-    forgot = []
+    """Drop everything remembered about a removed plugin."""
     try:
         os.unlink(os.path.join(STATE_DIR, "review-%s.json" % safe_id(pid)))
-        forgot.append("review")
     except OSError:
         pass
-    hist = read_json(HISTORY_FILE, MAX_STATE_BYTES, {})
-    if isinstance(hist, dict) and hist.pop(pid, None) is not None:
+    hist = load_history()
+    if hist.pop(pid, None) is not None:
         write_atomic(HISTORY_FILE, hist)
-        forgot.append("lock")
-    return {"id": pid, "forgot": forgot}
 
+
+# --------------------------------------------------- jobs
+#
+# Install, remove, update, restore and toggle all end with the shell
+# reloading its plugins, which unloads Plug's own window mid-job. So the
+# panel starts them detached; each one finishes the work, writes its result
+# to outcome.json, and summons Plug back — the next open reads the file. A
+# summon that misses still leaves the result waiting on disk.
+
+def write_outcome(highlight="", notice="", error="", tab="", moved=None):
+    d = {}
+    if highlight:
+        d["highlight"] = highlight
+    if error:
+        d["error"] = error
+    elif notice:
+        d["notice"] = notice
+    if tab:
+        d["tab"] = tab
+    if moved:
+        d["moved"] = moved
+    write_atomic(OUTCOME_FILE, d)
+
+
+def take_outcome():
+    d = read_json(OUTCOME_FILE, 64 * 1024, {})
+    try:
+        os.unlink(OUTCOME_FILE)
+    except OSError:
+        pass
+    return d if isinstance(d, dict) else {}
+
+
+def shell_ipc(*args, timeout=15):
+    code, text, _, _ = run_capped(["omarchy-shell", "shell"] + list(args),
+                                  timeout=timeout, cap=MAX_STATE_BYTES)
+    return code, text.strip()
+
+
+def refs_left(pid):
+    """Is this id still referenced in the live shell config? 0 = yes,
+    1 = no, 2 = the config could not be read — and 2 must never be treated
+    as 1, or removals report success having changed nothing."""
+    _, text = shell_ipc("listShellConfig")
+    try:
+        c = json.loads(text)
+    except ValueError:
+        return 2
+    if not isinstance(c, dict):
+        return 2
+
+    def eid(w):
+        return w.get("id") if isinstance(w, dict) else w
+
+    seen = []
+    bar = c.get("bar") if isinstance(c.get("bar"), dict) else {}
+    lay = bar.get("layout")
+    for sec in (lay.values() if isinstance(lay, dict) else (lay or [])):
+        for w in (sec or []):
+            seen.append(eid(w))
+    for w in (c.get("plugins") or []):
+        seen.append(eid(w))
+    return 0 if pid in seen else 1
+
+
+def is_on(pid):
+    """On means enabled or merely icon-hidden — hiding an icon is not
+    switching a plugin off."""
+    for p in live_plugins() or []:
+        if isinstance(p, dict) and p.get("id") == pid:
+            if p.get("enabled") is True:
+                return True
+            break
+    return refs_left(pid) == 0
+
+
+def clear_refs(pid):
+    """Clear every reference, judged by the config rather than the command's
+    own "ok" — anything installed the usual way is referenced twice, and one
+    call clears one. Returns "" on success or the error."""
+    for _ in range(5):
+        rc = refs_left(pid)
+        if rc == 2:
+            return "could not read the shell configuration"
+        if rc == 1:
+            return ""
+        _, out = shell_ipc("setPluginEnabled", pid, "false")
+        if out != "ok":
+            return out or "setPluginEnabled produced no output"
+    rc = refs_left(pid)
+    if rc == 0:
+        return "still referenced"
+    if rc == 2:
+        return "could not read the shell configuration"
+    return ""
+
+
+def session_locked():
+    try:
+        return subprocess.run(["omarchy-hyprland-session-locked"],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def finish(highlight="", notice="", error="", tab="", moved=None):
+    """Record the result and bring Plug back up with it. The shell may be
+    mid-teardown or restarting, so wait for it to answer first."""
+    write_outcome(highlight=highlight, notice=notice, error=error, tab=tab,
+                  moved=moved)
+    for _ in range(60):
+        _, text = shell_ipc("ping", timeout=5)
+        if text:
+            break
+        time.sleep(0.5)
+    for _ in range(20):
+        _, text = shell_ipc("summon", SELF_ID, "{}", timeout=5)
+        if text == "ok":
+            return
+        time.sleep(0.5)
+
+
+def job_remove(pid):
+    err = clear_refs(pid)
+    if not err:
+        code, out, cmderr, _ = run_capped(["omarchy", "plugin", "remove",
+                                           pid, "--yes"],
+                                          timeout=120, cap=MAX_GIT_BYTES)
+        if code != 0:
+            err = last_line(out + "\n" + cmderr) or "omarchy plugin remove failed"
+    if not err:
+        forget(pid)
+        finish(notice="Removed %s" % pid)
+    else:
+        finish(highlight=pid, error=err)
+
+
+def job_apply(verb, pid):
+    res = apply_update(pid) if verb == "apply" else rollback(pid)
+    err = str(res.get("error") or "")
+    deferred = False
+    if not err:
+        # A restart is what makes changed plugin code take effect — but never
+        # while the screen is locked, where it takes the lock screen with it.
+        if session_locked():
+            deferred = True
+        else:
+            run_capped(["omarchy-restart-shell"], timeout=60, cap=64 * 1024)
+    note = ("Updated %s" % pid if verb == "apply"
+            else "Restored %s to its previous version" % pid)
+    if deferred:
+        note += " — it loads when the shell next restarts"
+    if err:
+        finish(highlight=pid, error=err)
+    else:
+        finish(highlight=pid, notice=note)
+
+
+def read_landed_id(manifest_path):
+    """The id in an installed manifest, read with the same discipline as
+    every other read: no symlink, a regular file, a ceiling."""
+    try:
+        raw = read_capped(manifest_path, 256 * 1024, follow=False)
+        d = json.loads(raw.decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return ""
+    v = d.get("id") if isinstance(d, dict) else None
+    return v if isinstance(v, str) else ""
+
+
+def job_install(url, name, sha, pid, approved):
+    """Install from the store, bound to the commit that was reviewed: check
+    the repository has not moved, add switched off, verify what landed, pin
+    it if needed, and only then switch it on."""
+    if not sha:
+        finish(error="nothing was installed: no reviewed version was recorded for it")
+        return
+    head = remote_head(url)
+    if not head:
+        finish(error="could not reach the repository to check it")
+        return
+    if head != sha and not approved:
+        # Nothing was installed; the panel offers the choice.
+        finish(moved={"name": name or "That plugin", "sha": head})
+        return
+
+    err = ""
+    code, out, cmderr, _ = run_capped(["omarchy", "plugin", "add", url, "--yes"],
+                                      timeout=300, cap=MAX_GIT_BYTES)
+    if code != 0:
+        err = last_line(out + "\n" + cmderr) or "omarchy plugin add failed"
+
+    if not err and not pid:
+        err = "installed, but its plugin id was unknown so the version could not be checked"
+    if not err and not valid_plugin_id(pid):
+        err = "installed, but its plugin id is not a valid id, so the version could not be checked"
+    if not err:
+        d = os.path.join(PLUGINS_DIR, pid)
+        # The reviewed manifest and the fetched manifest can disagree on the
+        # id; the directory's own manifest is the authority on whose
+        # directory this is before anything is reset or removed in it.
+        landed = read_landed_id(os.path.join(d, "manifest.json"))
+        if os.path.isdir(os.path.join(d, ".git")) and landed != pid:
+            err = "installed, but it did not arrive under the id that was reviewed — nothing was changed"
+        elif not os.path.isdir(os.path.join(d, ".git")):
+            err = "installed, but %s is not where it was expected, so the version could not be checked" % pid
+        else:
+            _, headsha, _ = git(d, "rev-parse", "HEAD")
+            if headsha != sha:
+                code, kind, _ = git(d, "cat-file", "-t", sha)
+                ok = code == 0 and kind == "commit"
+                if ok:
+                    code, _, _ = git(d, "reset", "--hard", sha)
+                    ok = code == 0
+                if ok:
+                    _, headsha, _ = git(d, "rev-parse", "HEAD")
+                    ok = headsha == sha
+                if not ok:
+                    run_capped(["omarchy", "plugin", "remove", pid, "--yes"],
+                               timeout=120, cap=MAX_GIT_BYTES)
+                    err = "what arrived was not the version you approved — nothing was installed"
+
+    if not err:
+        # On, only now that what landed is confirmed to be what was read. The
+        # pin rewrites files, which makes the shell disable the plugin, so the
+        # switch-on is retried and confirmed rather than assumed.
+        for _ in range(6):
+            time.sleep(0.6)
+            if is_on(pid):
+                break
+            shell_ipc("setPluginEnabled", pid, "true")
+        if not is_on(pid):
+            err = ("installed at the version you reviewed, but it could not "
+                   "be switched on — turn it on from the list")
+
+    if err:
+        finish(error=err)
+    else:
+        finish(notice="Installed %s" % name)
+
+
+def job_toggle(verb, pid, attached):
+    if verb == "enable":
+        _, out = shell_ipc("setPluginEnabled", pid, "true")
+        err = "" if out == "ok" else (out or "setPluginEnabled produced no output")
+        if not err and not is_on(pid):
+            clear_refs(pid)
+            _, out = shell_ipc("setPluginEnabled", pid, "true")
+            err = "" if out == "ok" else (out or "setPluginEnabled produced no output")
+            if not err and not is_on(pid):
+                err = "could not switch it on"
+        note = "Enabled %s" % pid
+    else:
+        err = clear_refs(pid)
+        note = "Disabled %s" % pid
+    if attached:
+        # The panel is waiting on this process and re-reads state itself;
+        # summoning it would reset the very view it is guarding.
+        if err:
+            print(err, file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+    if err:
+        finish(highlight=pid, error=err)
+    else:
+        finish(highlight=pid, notice=note)
+
+
+def job_bar(state, section):
+    ctl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plug-ctl.sh")
+    code, _, err, _ = run_capped(["bash", ctl, "bar", state, section],
+                                 timeout=30, cap=64 * 1024)
+    if code != 0:
+        finish(error=last_line(err) or "could not update the bar icon", tab="settings")
+    else:
+        finish(notice="Bar icon updated", tab="settings")
+
+
+def run_job(args):
+    verb = args[0] if args else ""
+    rest = [a for a in args[1:] if a != "--attached"]
+    attached = "--attached" in args[1:]
+    if verb == "remove" and rest:
+        job_remove(rest[0])
+    elif verb in ("apply", "rollback") and rest:
+        job_apply(verb, rest[0])
+    elif verb == "install" and rest:
+        approved = "--approved-version" in rest
+        rest = [a for a in rest if a != "--approved-version"]
+        url = rest[0]
+        name = rest[1] if len(rest) > 1 else url
+        sha = rest[2] if len(rest) > 2 else ""
+        pid = rest[3] if len(rest) > 3 else ""
+        job_install(url, name, sha, pid, approved)
+    elif verb in ("enable", "disable") and rest:
+        job_toggle(verb, rest[0], attached)
+    elif verb == "bar" and rest:
+        job_bar(rest[0], rest[1] if len(rest) > 1 else "right")
+    else:
+        print(json.dumps({"error": "unknown job: %s" % verb}))
+        sys.exit(2)
+
+
+# --------------------------------------------------- cli
 
 def main():
     ap = argparse.ArgumentParser(prog="plugd")
     sub = ap.add_subparsers(dest="cmd")
-    sub.add_parser("snapshot")
-    sub.add_parser("check-updates")
-    sub.add_parser("catalog")
-    sub.add_parser("agents")
-    for name in ("scan", "review", "apply", "rollback", "forget"):
-        p = sub.add_parser(name)
-        p.add_argument("id")
-    p = sub.add_parser("inspect")
-    p.add_argument("url")
-    # Asked before an install: is the repository still at the commit that was
-    # reviewed? Answered without downloading anything.
-    p = sub.add_parser("still-at")
-    p.add_argument("url")
-    p.add_argument("sha")
+    for name in ("rows", "snapshot", "check-updates", "catalog", "agents",
+                 "outcome", "print-settings", "print-catalog"):
+        sub.add_parser(name)
+    sub.add_parser("review").add_argument("id")
+    sub.add_parser("inspect").add_argument("url")
+    sub.add_parser("set-settings").add_argument("json")
+    sub.add_parser("job").add_argument("args", nargs="+")
     args = ap.parse_args()
 
     ensure_state_dir()
-    # snapshot/check-updates write state.json (which the panel reads back
-    # through a capped reader). Printing only a small status here keeps the
-    # panel from holding the whole state a second time off stdout.
-    if args.cmd == "snapshot" or args.cmd is None:
+    if args.cmd == "rows":
+        print(json.dumps(rows()))
+    elif args.cmd == "snapshot" or args.cmd is None:
         s = snapshot(check_updates=False)
         print(json.dumps({"ok": True, "plugins": len(s["plugins"])}))
     elif args.cmd == "check-updates":
         s = snapshot(check_updates=True)
         updates = sum(1 for p in s["plugins"].values() if p.get("updateAvailable"))
-        print(json.dumps({"ok": True, "plugins": len(s["plugins"]), "updates": updates}))
+        print(json.dumps({"ok": True, "plugins": len(s["plugins"]),
+                          "updates": updates}))
     elif args.cmd == "catalog":
         try:
             c = build_catalog()
-            # `truncated` travels with the answer this fetch produced. The
-            # panel was composing its notice from the flag left over from the
-            # last file it READ, so the first trimmed fetch reported nothing
-            # unusual and the next clean one carried the warning instead —
-            # a message that was right about a fetch, one fetch too late.
             print(json.dumps({"ok": True, "count": c["count"],
                               "truncated": bool(c.get("truncated"))}))
         except urllib.error.URLError as e:
@@ -2107,44 +1947,41 @@ def main():
                               "could not reach the marketplace (%s)"
                               % str(getattr(e, "reason", e))[:120]}))
         except Exception as e:
-            # Part of this text can come from whatever answered the request,
-            # so it is capped here and rendered as plain text at the panel.
             print(json.dumps({"ok": False, "error": str(e)[:200]}))
     elif args.cmd == "agents":
         print(json.dumps(available_agents()))
-    elif args.cmd == "scan":
-        inv = installed_ids()
-        if args.id not in inv:
-            print(json.dumps({"error": "not installed"}))
-        else:
-            print(json.dumps(scan_plugin(inv[args.id]["dir"])))
+    elif args.cmd == "outcome":
+        print(json.dumps(take_outcome()))
+    elif args.cmd == "print-settings":
+        d = read_json(SETTINGS_FILE, MAX_SETTINGS_BYTES, {})
+        print(json.dumps(d if isinstance(d, dict) else {}))
+    elif args.cmd == "print-catalog":
+        d = read_json(CATALOG_FILE, MAX_CATALOG_BYTES, {})
+        print(json.dumps(d if isinstance(d, dict) else {}))
+    elif args.cmd == "set-settings":
+        if len(args.json) > MAX_SETTINGS_BYTES:
+            print(json.dumps({"ok": False, "error": "settings too large"}))
+            return
+        try:
+            d = json.loads(args.json)
+        except ValueError:
+            d = None
+        if not isinstance(d, dict):
+            print(json.dumps({"ok": False, "error": "not a settings object"}))
+            return
+        write_atomic(SETTINGS_FILE, d)
+        print(json.dumps({"ok": True}))
     elif args.cmd == "review":
         print(json.dumps(review(args.id)))
     elif args.cmd == "inspect":
         print(json.dumps(inspect_repo(args.url)))
-    elif args.cmd == "still-at":
-        head = remote_head(args.url)
-        print(json.dumps({"url": args.url, "reviewed": args.sha, "now": head,
-                          "same": bool(head) and head == args.sha,
-                          "reachable": bool(head)}))
-    elif args.cmd == "apply":
-        print(json.dumps(apply_update(args.id)))
-    elif args.cmd == "rollback":
-        print(json.dumps(rollback(args.id)))
-    elif args.cmd == "forget":
-        print(json.dumps(forget(args.id)))
+    elif args.cmd == "job":
+        run_job(args.args)
 
 
 def _exit_on_term(_signum, _frame):
-    """Turn a stop request into an ordinary exit, so cleanup happens.
-
-    The panel stops this program when the user backs out of a review, and the
-    default handling of SIGTERM kills the process outright — skipping the
-    `finally` that deletes the temporary clone. Every cancelled review then
-    left up to the clone ceiling behind in the temp directory, permanently.
-    Raising SystemExit instead unwinds the stack the normal way, so every
-    `finally` in the call chain runs and the clone goes with it.
-    """
+    # An ordinary exit, so every `finally` runs and temporary clones are
+    # deleted when the panel cancels a review.
     raise SystemExit(143)
 
 

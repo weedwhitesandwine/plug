@@ -93,10 +93,11 @@ The reviewer is entirely your choice, set in **Settings**. Plug offers only the
 tools you actually have:
 
 - **Claude Code** — if the `claude` command is installed. It is run once, in
-  an empty working directory, in plan mode with no tools at all, and with a
-  trimmed environment holding only its own credentials and nothing else your
-  shell was carrying. It reads the diff it was given and has nothing else to
-  act with.
+  an empty working directory, in plan mode with no tools at all, and under a
+  throwaway home directory holding only its own Claude settings — the
+  environment it sees carries its own credentials and nothing else your shell
+  or your real home was carrying. It reads the diff it was given and has
+  nothing else to act with.
 - **Local servers** — Ollama or LM Studio, if they are running. The review is a
   request to `localhost`, so **nothing leaves your machine** — a real LLM review
   that is completely private. Their loaded models are listed automatically.
@@ -158,7 +159,9 @@ scan results per plugin), `catalog.json` (the marketplace catalog, cached),
 `settings.json` (your choices), `locks.json` (restore bookkeeping — which
 version each applied update came from), `review-<plugin-id>.json` (the last
 review of that plugin: the verdict, the summary, and the two commits it was
-read between, which is what the apply is checked against).
+read between, which is what the apply is checked against), and
+`outcome.json` (the result of the last job — written when an install, update,
+restore or removal finishes, shown and deleted the next time Plug opens).
 
 **Outside its own directory** — only in response to something you do:
 
@@ -169,19 +172,21 @@ read between, which is what the apply is checked against).
 | a plugin's own checkout under `~/.config/omarchy/plugins/…` | `git fetch` against every installed plugin's remote each time the panel opens (the update check, which you can turn off with `autoCheck`) and each time you press **Check for updates**; and, for the one plugin you act on, a fast-forward when you update it or a `reset` when you restore it |
 | a temporary directory | two things, both read and then deleted: a shallow clone of a plugin you asked Plug to check before installing, and — when you review an update — a copy of the incoming version's files extracted from the plugin's own repository, so the reviewer reads the new code rather than only the diff |
 
-**Commands it runs:** `omarchy-shell shell listPlugins` / `listShellConfig` /
+**Commands it runs:** `python3` (Plug's own engine, `plugd.py` — every job
+goes through it); `omarchy-shell shell listPlugins` / `listShellConfig` /
 `setPluginEnabled` (read the list and your shell config; enable/disable on your
 click); `omarchy-restart-shell` (only after you apply an update or a restore —
 see below — and never while the screen is locked) with `omarchy-shell shell
-ping` / `summon` to bring Plug back afterwards with the result;
-`omarchy plugin add` / `remove` (install/uninstall on your click); `git` inside each plugin's checkout (read its
+ping` / `summon` to bring Plug back afterwards; `omarchy plugin add` / `remove`
+(install/uninstall on your click); `git` inside each plugin's checkout (read its
 state, fetch updates, show the diff, apply or revert); `hyprctl binds` (read
-active shortcuts) and `hyprctl reload` (after a hotkey change); `python3` (Plug's
-own engine); `bash` (Plug's own `plug-ctl.sh`); `wl-copy` (only when you press
-**Copy the commands** on a manual install, with the commands passed as an
-argument rather than through a shell); `xdg-open` (only when you open a
-plugin's repository page); and the AI reviewer you chose — either the
-`claude` command or a request to a local server on `localhost`.
+active shortcuts) and `hyprctl reload` (after a hotkey change); `bash` (Plug's
+own `plug-ctl.sh`, which holds the two consent edits: the hotkey block and the
+bar-icon entry); `wl-copy` (only when you press **Copy the commands** on a
+manual install, with the commands passed as an argument rather than through a
+shell); `xdg-open` (only when you open a plugin's repository page); and the AI
+reviewer you chose — either the `claude` command or a request to a local
+server on `localhost`.
 
 **What runs when the shell starts.** Plug builds its reviewer list once, as the
 shell loads it. That run does two things: `which claude`, and an HTTP request to
@@ -214,8 +219,10 @@ the bar and the panels reload. Nothing else Plug does restarts anything.
 
 **Timers and background work:** none that runs on its own. The jobs you start —
 install, remove, update, restore, on/off — outlive Plug's own window, since the
-reload that finishes them also closes it. Each one ends by reopening Plug on the
-plugin it acted on and telling you what happened.
+reload that finishes them also closes it. Each one ends by writing what
+happened to `outcome.json` in Plug's own state directory and reopening Plug,
+which reads the note, shows it, and deletes it — so the result reaches you
+even if the reopening is missed.
 
 Everything runs as your own user.
 
@@ -235,7 +242,8 @@ shell process that stays up for days, so all of it is treated as data:
   helper script, and refused rather than escaped, because it becomes Lua source
   in `bindings.lua`.
 - The AI reviewer is handed the diff as data, never as instructions, in an
-  empty working directory and with an environment trimmed to its own
+  empty working directory, under a throwaway home directory holding only the
+  reviewer's own settings, with an environment trimmed to its own
   credentials. Claude Code runs in plan mode with no tools at all, so it has
   genuinely nothing to act with beyond the text it was given.
 - `git` runs against each untrusted checkout with the repository's own hooks and
