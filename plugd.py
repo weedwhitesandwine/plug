@@ -40,6 +40,7 @@ HISTORY_FILE = os.path.join(STATE_DIR, "locks.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 OUTCOME_FILE = os.path.join(STATE_DIR, "outcome.json")
 OPENCODE_BIN_FILE = os.path.join(STATE_DIR, "opencode-bin.json")
+OPENCODE_MODELS_FILE = os.path.join(STATE_DIR, "opencode-models.json")
 
 SELF_ID = "io.github.weedwhitesandwine.plug"
 
@@ -1126,26 +1127,41 @@ def jail_argv(argv, ro_binds=(), env_prefixes=JAIL_ENV_PREFIXES):
     return cmd + list(argv), {}
 
 
+# How long a model list is kept before Opencode is asked again. Asking runs
+# Opencode itself, which on some installs resolves its package through the
+# network — so it must not happen every time the settings view is opened.
+OPENCODE_MODELS_TTL = 24 * 60 * 60
+
+
 def opencode_models():
     """The models this Opencode can use, free ones first.
 
     Opencode ships models that need no account at all (the `opencode/…`
     tier) alongside provider models that spend the user's own API credit, so
-    the free ones lead and one of them is the default. Nothing here is
-    hard-coded: the list comes from Opencode itself, and an unreachable or
-    slow listing falls back to whatever was cached."""
+    the free ones lead and one of them is the default. Nothing is hard-coded:
+    the list comes from Opencode itself, cached for a day, and a listing that
+    fails keeps the last good answer."""
+    cached = read_json(OPENCODE_MODELS_FILE, 64 * 1024, {})
+    have = []
+    if isinstance(cached, dict) and isinstance(cached.get("models"), list):
+        have = [m for m in cached["models"] if isinstance(m, str)]
+        try:
+            fresh = (time.time() - float(cached.get("at", 0))) < OPENCODE_MODELS_TTL
+        except (TypeError, ValueError):
+            fresh = False
+        if have and fresh:
+            return have
     code, out, _, _ = run_capped(["opencode", "models"], timeout=20,
                                  cap=64 * 1024)
     names = [l.strip() for l in out.split("\n") if l.strip() and "/" in l]
     names = [n for n in names if len(n) <= 120][:60]
     if code != 0 or not names:
-        cached = read_json(OPENCODE_BIN_FILE, 64 * 1024, {})
-        if isinstance(cached, dict) and isinstance(cached.get("models"), list):
-            return [m for m in cached["models"] if isinstance(m, str)]
-        return []
+        return have
     free = [n for n in names if n.startswith("opencode/")]
     rest = [n for n in names if not n.startswith("opencode/")]
-    return free + rest
+    models = free + rest
+    write_atomic(OPENCODE_MODELS_FILE, {"at": time.time(), "models": models})
+    return models
 
 
 def opencode_package_dir(binpath):

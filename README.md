@@ -189,9 +189,12 @@ reviewer you chose — either the `claude` command or a request to a local
 server on `localhost`.
 
 **What runs when the shell starts.** Plug builds its reviewer list once, as the
-shell loads it. That run does two things: `which claude`, and an HTTP request to
-`localhost:11434` and `localhost:1234` to see whether Ollama or LM Studio is
-listening. Both requests go to the loopback interface and ask one question —
+shell loads it. That run does three things: `which claude` and `which opencode`;
+an HTTP request to `localhost:11434` and `localhost:1234` to see whether Ollama
+or LM Studio is listening; and, if Opencode is installed and its saved model
+list is more than a day old, `opencode models` to refresh it — which on installs
+where `opencode` is a wrapper resolves its package through the network. That
+list is then read from disk until it ages out again. Both requests go to the loopback interface and ask one question —
 whether a local server is there. `hyprctl binds` also runs at startup, to know
 which key combinations Hyprland has already taken. Everything the reviewer list
 needs is gathered in that one run, and it is the same list every time you open
