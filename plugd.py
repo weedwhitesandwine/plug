@@ -39,6 +39,7 @@ CATALOG_FILE = os.path.join(STATE_DIR, "catalog.json")
 HISTORY_FILE = os.path.join(STATE_DIR, "locks.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 OUTCOME_FILE = os.path.join(STATE_DIR, "outcome.json")
+OPENCODE_BIN_FILE = os.path.join(STATE_DIR, "opencode-bin.json")
 
 SELF_ID = "io.github.weedwhitesandwine.plug"
 
@@ -47,6 +48,14 @@ AGENTS = {
         "label": "Claude Code", "type": "cli", "bin": "claude",
         "models": ["sonnet", "opus", "haiku"], "default_model": "sonnet",
         "private": False,
+    },
+    # Opencode keeps its tools, so it only ever runs inside the jail — and is
+    # only offered when bubblewrap is installed to build one. It uses the
+    # model configured in the user's own Opencode settings, so there is no
+    # model list here to go stale.
+    "opencode": {
+        "label": "Opencode (sandboxed)", "type": "cli", "bin": "opencode",
+        "models": [], "default_model": "", "private": False, "jail": True,
     },
     "ollama": {
         "label": "Ollama (local, private)", "type": "http",
@@ -815,7 +824,11 @@ def agent_available(agent_key):
     if not spec:
         return False
     if spec["type"] == "cli":
-        return shutil.which(spec["bin"]) is not None
+        if shutil.which(spec["bin"]) is None:
+            return False
+        # An agent that keeps its tools is not offered at all without a jail
+        # to put it in.
+        return have_jail() if spec.get("jail") else True
     if spec["type"] == "http":
         return http_agent_models(spec) is not None
     return False
@@ -829,8 +842,17 @@ def available_agents():
         if spec["type"] == "cli":
             if shutil.which(spec["bin"]) is None:
                 continue
+            if spec.get("jail") and not have_jail():
+                continue
             models = spec["models"]
             default = spec["default_model"]
+            if key == "opencode":
+                models = opencode_models()
+                # A model that costs nothing and needs no account, so
+                # choosing this reviewer never quietly spends the user's
+                # provider credit. They can pick a paid one deliberately.
+                free = [m for m in models if m.startswith("opencode/")]
+                default = free[0] if free else (models[0] if models else "")
         else:
             models = http_agent_models(spec)
             if models is None:
@@ -1052,6 +1074,120 @@ def reviewer_env(workdir):
             os.symlink(src, os.path.join(fake, name))
     env["HOME"] = fake
     return env
+
+
+# ------------------------------------------------- the reviewer jail
+#
+# Claude Code is run with no tools at all, so a trimmed environment and a
+# throwaway home are enough: it has nothing to act with. A reviewer that
+# keeps its tools — Opencode — needs the filesystem itself taken away,
+# because "read-only tools" still means reading whatever the user can read.
+# So it runs under bubblewrap: a tmpfs home, an empty working directory, a
+# read-only /usr, and nothing of the real home except the one binary it runs
+# from. Its own settings are replaced with a config that denies every tool,
+# so the code under review is text and only text.
+#
+# The network stays reachable, because a reviewer that cannot call its model
+# cannot review. That is the boundary this buys: the jailed agent can talk to
+# its provider and can reach nothing of yours to talk about.
+JAIL_ENV_PREFIXES = ("OPENCODE_", "ANTHROPIC_", "OPENAI_")
+
+
+def have_jail():
+    return shutil.which("bwrap") is not None
+
+
+def jail_argv(argv, ro_binds=(), env_prefixes=JAIL_ENV_PREFIXES):
+    """Wrap a command so it runs with no view of the real filesystem.
+
+    `ro_binds` are (host, jail) pairs mounted read-only — the agent's own
+    program, and nothing else. Returns (argv, env)."""
+    cmd = ["bwrap", "--die-with-parent", "--new-session",
+           "--unshare-pid", "--unshare-uts", "--unshare-ipc",
+           "--ro-bind", "/usr", "/usr",
+           "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
+           "--symlink", "usr/bin", "/bin", "--symlink", "usr/bin", "/sbin",
+           "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    for host in ("/etc/resolv.conf", "/etc/ssl", "/etc/ca-certificates"):
+        if os.path.exists(host):
+            cmd += ["--ro-bind", host, host]
+    cmd += ["--tmpfs", "/jail", "--dir", "/jail/home", "--dir", "/jail/work"]
+    for host, dest in ro_binds:
+        if os.path.exists(host):
+            cmd += ["--ro-bind", host, dest]
+    cmd += ["--clearenv",
+            "--setenv", "HOME", "/jail/home",
+            "--setenv", "PATH", "/usr/bin",
+            "--setenv", "TERM", "dumb",
+            "--chdir", "/jail/work"]
+    for k, v in os.environ.items():
+        if k.startswith(env_prefixes):
+            cmd += ["--setenv", k, v]
+    return cmd + list(argv), {}
+
+
+def opencode_models():
+    """The models this Opencode can use, free ones first.
+
+    Opencode ships models that need no account at all (the `opencode/…`
+    tier) alongside provider models that spend the user's own API credit, so
+    the free ones lead and one of them is the default. Nothing here is
+    hard-coded: the list comes from Opencode itself, and an unreachable or
+    slow listing falls back to whatever was cached."""
+    code, out, _, _ = run_capped(["opencode", "models"], timeout=20,
+                                 cap=64 * 1024)
+    names = [l.strip() for l in out.split("\n") if l.strip() and "/" in l]
+    names = [n for n in names if len(n) <= 120][:60]
+    if code != 0 or not names:
+        cached = read_json(OPENCODE_BIN_FILE, 64 * 1024, {})
+        if isinstance(cached, dict) and isinstance(cached.get("models"), list):
+            return [m for m in cached["models"] if isinstance(m, str)]
+        return []
+    free = [n for n in names if n.startswith("opencode/")]
+    rest = [n for n in names if not n.startswith("opencode/")]
+    return free + rest
+
+
+def opencode_package_dir(binpath):
+    """The directory to mount so a resolved node package binary can run: the
+    tree above its node_modules, or the file itself for a plain binary."""
+    real = os.path.realpath(binpath)
+    marker = "/node_modules/"
+    i = real.find(marker)
+    return real[:i] if i > 0 else real
+
+
+def resolve_opencode_bin():
+    """The real Opencode program. On some installs `opencode` on PATH is a
+    wrapper that resolves the package through npx at run time, which cannot
+    work inside the jail — so the resolved path is found once, cached, and
+    re-resolved if it goes stale."""
+    cached = read_json(OPENCODE_BIN_FILE, 64 * 1024, {})
+    if isinstance(cached, dict):
+        p = cached.get("bin", "")
+        if isinstance(p, str) and p and os.access(p, os.X_OK):
+            return p
+    p = shutil.which("opencode")
+    if not p:
+        return ""
+    try:
+        if peek_head(p, 2)[:2] != b"#!":
+            write_atomic(OPENCODE_BIN_FILE, {"bin": p, "resolvedAt": now_iso()})
+            return p
+    except OSError:
+        return ""
+    # A wrapper script. Ask it where the package's own binary lives, rather
+    # than guessing at any particular installer's layout.
+    code, out, _, _ = run_capped(
+        ["bash", "-lc",
+         'command -v npx >/dev/null 2>&1 || exit 1; '
+         'npx --yes --package opencode-ai -- which opencode 2>/dev/null'],
+        timeout=180, cap=64 * 1024)
+    line = last_line(out)
+    if code == 0 and line and os.access(line, os.X_OK):
+        write_atomic(OPENCODE_BIN_FILE, {"bin": line, "resolvedAt": now_iso()})
+        return line
+    return ""
 
 
 REVIEW_SYSTEM = (
@@ -1282,6 +1418,40 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                 raw = raw.strip()
             finally:
                 shutil.rmtree(empty, ignore_errors=True)
+        elif agent == "opencode":
+            binpath = resolve_opencode_bin()
+            if not binpath:
+                raise ValueError("could not find Opencode's own program to run")
+            jail = tempfile.mkdtemp(prefix="plug-review-")
+            try:
+                # Its settings inside the jail are ours, not the user's: every
+                # tool denied, so the reviewer reads the prompt and nothing
+                # else. --pure keeps the user's Opencode plugins out of it.
+                cfg = os.path.join(jail, "opencode.json")
+                with open(cfg, "w") as f:
+                    json.dump({"permission": {"edit": "deny", "bash": "deny",
+                                              "webfetch": "deny"}}, f)
+                pkg = opencode_package_dir(binpath)
+                argv = [binpath, "run", "--pure", "--format", "json",
+                        "--agent", "plan"]
+                # Always explicit, so a review runs on the model the user
+                # chose rather than whatever Opencode would default to — the
+                # difference between free and billed.
+                if model:
+                    argv += ["-m", model]
+                cmd, _ = jail_argv(
+                    argv + ["--", REVIEW_SYSTEM + "\n\n" + prompt],
+                    ro_binds=((pkg, pkg),
+                              (cfg, "/jail/home/.config/opencode/opencode.json")))
+                # stdin closed: with a terminal on stdin Opencode waits for
+                # input that is never coming and the review hangs until the
+                # timeout.
+                code, raw, _, _ = run_capped(
+                    cmd, timeout=CLAUDE_TIMEOUT, cap=MAX_AGENT_BYTES,
+                    env=os.environ.copy(), stdin=subprocess.DEVNULL)
+                raw = opencode_text(raw)
+            finally:
+                shutil.rmtree(jail, ignore_errors=True)
         else:
             return offline_summary(diff, scan_facts, plugin_name, context)
     except (OSError, subprocess.SubprocessError, urllib.error.URLError,
@@ -1297,6 +1467,25 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
         fb["raw"] = raw
         return fb
     return parsed
+
+
+def opencode_text(raw):
+    """The assistant's words out of Opencode's JSON event stream. Each line is
+    one event; anything unparseable is skipped rather than failing the run."""
+    parts = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "text":
+            part = ev.get("part")
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+    return "\n".join(parts).strip()
 
 
 def parse_review(raw):
