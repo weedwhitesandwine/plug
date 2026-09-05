@@ -50,10 +50,11 @@ AGENTS = {
         "models": ["sonnet", "opus", "haiku"], "default_model": "sonnet",
         "private": False,
     },
-    # Opencode keeps its tools, so it only ever runs inside the jail — and is
-    # only offered when bubblewrap is installed to build one. It uses the
-    # model configured in the user's own Opencode settings, so there is no
-    # model list here to go stale.
+    # Opencode keeps its tools, so every review runs inside the jail — and it
+    # is only offered when bubblewrap is installed to build one. Listing its
+    # models is the one thing that runs unjailed, because it reads nothing of
+    # the plugin under review; that list is fetched from Opencode itself and
+    # cached, so it is not hard-coded here.
     "opencode": {
         "label": "Opencode (sandboxed)", "type": "cli", "bin": "opencode",
         "models": [], "default_model": "", "private": False, "jail": True,
@@ -849,11 +850,18 @@ def available_agents():
             default = spec["default_model"]
             if key == "opencode":
                 models = opencode_models()
+                # With no model list there is no way to name a model at review
+                # time, and Opencode would then fall back to whatever the
+                # user's own configuration defaults to — possibly a billed
+                # one. Offering it on those terms would break the promise
+                # below, so it is not offered until a list is known.
+                if not models:
+                    continue
                 # A model that costs nothing and needs no account, so
                 # choosing this reviewer never quietly spends the user's
                 # provider credit. They can pick a paid one deliberately.
                 free = [m for m in models if m.startswith("opencode/")]
-                default = free[0] if free else (models[0] if models else "")
+                default = free[0] if free else models[0]
         else:
             models = http_agent_models(spec)
             if models is None:
@@ -1131,6 +1139,10 @@ def jail_argv(argv, ro_binds=(), env_prefixes=JAIL_ENV_PREFIXES):
 # Opencode itself, which on some installs resolves its package through the
 # network — so it must not happen every time the settings view is opened.
 OPENCODE_MODELS_TTL = 24 * 60 * 60
+# And how long to wait after a listing that failed. Without this the one case
+# the cache exists for — a listing that is slow or unreachable — is the case
+# that retries on every settings open, blocking the reviewer list each time.
+OPENCODE_MODELS_RETRY = 10 * 60
 
 
 def opencode_models():
@@ -1141,21 +1153,36 @@ def opencode_models():
     the free ones lead and one of them is the default. Nothing is hard-coded:
     the list comes from Opencode itself, cached for a day, and a listing that
     fails keeps the last good answer."""
+    def age(stamp):
+        """Seconds since a recorded time, or None if it is unusable. A clock
+        that was ahead when the stamp was written would otherwise make the
+        entry look fresh until real time caught up — and this runs at shell
+        start, which on a laptop is before NTP has fixed anything."""
+        try:
+            a = time.time() - float(stamp)
+        except (TypeError, ValueError):
+            return None
+        return a if a >= 0 else None
+
     cached = read_json(OPENCODE_MODELS_FILE, 64 * 1024, {})
     have = []
-    if isinstance(cached, dict) and isinstance(cached.get("models"), list):
-        have = [m for m in cached["models"] if isinstance(m, str)]
-        try:
-            fresh = (time.time() - float(cached.get("at", 0))) < OPENCODE_MODELS_TTL
-        except (TypeError, ValueError):
-            fresh = False
-        if have and fresh:
+    if isinstance(cached, dict):
+        if isinstance(cached.get("models"), list):
+            have = [m for m in cached["models"] if isinstance(m, str)]
+        a = age(cached.get("at"))
+        if have and a is not None and a < OPENCODE_MODELS_TTL:
+            return have
+        f = age(cached.get("failedAt"))
+        if f is not None and f < OPENCODE_MODELS_RETRY:
             return have
     code, out, _, _ = run_capped(["opencode", "models"], timeout=20,
                                  cap=64 * 1024)
     names = [l.strip() for l in out.split("\n") if l.strip() and "/" in l]
     names = [n for n in names if len(n) <= 120][:60]
     if code != 0 or not names:
+        write_atomic(OPENCODE_MODELS_FILE,
+                     {"at": cached.get("at", 0) if isinstance(cached, dict) else 0,
+                      "models": have, "failedAt": time.time()})
         return have
     free = [n for n in names if n.startswith("opencode/")]
     rest = [n for n in names if not n.startswith("opencode/")]
@@ -1452,6 +1479,10 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
             binpath = resolve_opencode_bin()
             if not binpath:
                 raise ValueError("could not find Opencode's own program to run")
+            # Never leave the model to Opencode's own default: that is how a
+            # review ends up on a billed model nobody chose.
+            if not model:
+                raise ValueError("no model chosen for Opencode")
             jail = tempfile.mkdtemp(prefix="plug-review-")
             try:
                 # Its settings inside the jail are ours, not the user's: every
