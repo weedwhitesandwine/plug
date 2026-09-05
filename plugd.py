@@ -1915,6 +1915,14 @@ def run_job(args):
 # --------------------------------------------------- cli
 
 def main():
+    # Job arguments carry flags like --attached and --approved-version, which
+    # an argument parser would claim as its own options; they go straight
+    # through.
+    if len(sys.argv) > 1 and sys.argv[1] == "job":
+        ensure_state_dir()
+        run_job(sys.argv[2:])
+        return
+
     ap = argparse.ArgumentParser(prog="plugd")
     sub = ap.add_subparsers(dest="cmd")
     for name in ("rows", "snapshot", "check-updates", "catalog", "agents",
@@ -1923,7 +1931,6 @@ def main():
     sub.add_parser("review").add_argument("id")
     sub.add_parser("inspect").add_argument("url")
     sub.add_parser("set-settings").add_argument("json")
-    sub.add_parser("job").add_argument("args", nargs="+")
     args = ap.parse_args()
 
     ensure_state_dir()
@@ -1975,8 +1982,6 @@ def main():
         print(json.dumps(review(args.id)))
     elif args.cmd == "inspect":
         print(json.dumps(inspect_repo(args.url)))
-    elif args.cmd == "job":
-        run_job(args.args)
 
 
 def _exit_on_term(_signum, _frame):
