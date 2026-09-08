@@ -81,7 +81,7 @@ English, whether it is safe.
 The reviewer is entirely your choice, set in **Settings**. Plug offers only the
 tools you actually have:
 
-- **Claude Code** — if the `claude` command is installed. It is run once, in
+- **Claude Code** — if the `claude` command is installed and starts. It is run once, in
   an empty working directory, in plan mode with no tools at all, and under a
   throwaway home directory holding only its own Claude settings — the
   environment it sees carries its own credentials and nothing else your shell
@@ -190,16 +190,24 @@ bar-icon entry); `wl-copy` (only when you press **Copy the commands** on a
 manual install, with the commands passed as an argument rather than through a
 shell); `xdg-open` (only when you open a plugin's repository page); and the AI
 reviewer you chose — the `claude` command, the `opencode` command inside a
-`bwrap` sandbox, or a request to a local server on `localhost`.
+`bwrap` sandbox, or a request to a local server on `localhost`; and `mise which
+<name>`, where a reviewer's command on your PATH is a `mise` shim rather than
+the program itself.
 
 Two Opencode commands run **outside** the sandbox: `opencode models`, to list
 what it can run (at most once a day), and — only where `opencode` is a wrapper
 script rather than the program itself — `npx --yes --package opencode-ai --
 which opencode` once, to find the real program, which fetches the package from
-npm. The answer is cached.
+npm. That lookup runs while the reviewer list is built, so on a wrapper install
+it can happen as the shell starts; it is abandoned after a minute, and a
+failure is not retried for ten. The answer is cached either way.
 
 **What runs when the shell starts.** Plug builds its reviewer list once, as the
-shell loads it. That run does three things: `which claude` and `which opencode`;
+shell loads it. That run does four things: it looks for `claude` and `opencode`
+on your PATH, running `mise which` for the real program where either is a
+`mise` shim; it starts each one it found, once, with `--version` — under the
+same throwaway home, or inside the same sandbox, that a review would use, so a
+reviewer is offered only when it has been seen to run;
 an HTTP request to `localhost:11434` and `localhost:1234` to see whether Ollama
 or LM Studio is listening; and, if Opencode is installed and its saved model
 list is more than a day old, `opencode models` to refresh it — which on installs

@@ -821,18 +821,124 @@ def http_agent_models(spec):
     return models
 
 
+_CLI_BIN_CACHE = {}
+
+
+def resolve_cli_bin(name):
+    """The reviewer's real program, resolved while the real environment is
+    still intact.
+
+    A tool installed through a version manager sits on PATH as a shim that
+    re-resolves itself out of $HOME at the moment it runs. A reviewer runs
+    with HOME replaced by a throwaway directory, so the shim looks for the
+    tool where nothing is installed, writes its complaint to stderr and
+    produces no reply — and the review falls back to the offline scan with
+    the user never told why the reviewer they chose did not read anything.
+    Resolving past the shim here is what keeps the chosen reviewer the one
+    that actually runs.
+
+    Returns "" when the name is not on PATH at all, or is a shim standing in
+    for a tool that is no longer installed. Both mean the agent genuinely
+    cannot run, so it is not offered. The answer is held for the life of the
+    process, which is one command."""
+    if name in _CLI_BIN_CACHE:
+        return _CLI_BIN_CACHE[name]
+    _CLI_BIN_CACHE[name] = resolved = _resolve_cli_bin(name)
+    return resolved
+
+
+def _resolve_cli_bin(name):
+    p = shutil.which(name)
+    if not p:
+        return ""
+    try:
+        real = os.path.realpath(p)
+    except OSError:
+        return p
+    if os.path.basename(real) != "mise":
+        return p
+    # Ask the shim's own program where the tool lives, here, with the user's
+    # real HOME — the one place the question can still be answered.
+    #
+    # From `/`, deliberately. mise answers for the directory it is asked in,
+    # and it inherits whatever directory the shell happened to start in; a
+    # `mise.toml` there naming a version that is not installed makes the tool
+    # unresolvable and the reviewer would vanish from Settings for a reason
+    # that has nothing to do with the reviewer. `/` asks for the user's own
+    # global tools, which is what a plugin's reviewer runs on.
+    code, out, _, _ = run_capped([real, "which", name], timeout=30,
+                                 cap=64 * 1024, cwd="/")
+    line = last_line(out)
+    if code == 0 and line and os.access(line, os.X_OK):
+        return line
+    return ""
+
+
+# How long a reviewer gets to prove it can start, and how much of its answer
+# is read. The shell's own start-up waits on this, so it is bounded.
+AGENT_PROBE_TIMEOUT = 15
+AGENT_PROBE_BYTES = 8 * 1024
+_AGENT_STARTS_CACHE = {}
+
+
+def agent_binary(key, spec):
+    """The program a review of this agent would actually execute — one answer,
+    used by the offer and by the review, so the two cannot disagree."""
+    if key == "opencode":
+        return resolve_opencode_bin()
+    return resolve_cli_bin(spec["bin"])
+
+
+def agent_starts(key, spec, binpath):
+    """Whether the reviewer can START the way a review starts it.
+
+    Being on PATH is not the property that matters. A command can resolve
+    perfectly and still produce nothing once it runs under a throwaway home,
+    inside the jail, or through an interpreter that is itself a shim — which
+    is how a chosen reviewer ends up silently replaced by the offline scan.
+    Rather than keep a list of the ways that can happen, run the thing under
+    the conditions the review uses and believe what it does. A reviewer that
+    cannot say its own version is not going to read anybody's code."""
+    cached = _AGENT_STARTS_CACHE.get((key, binpath))
+    if cached is not None:
+        return cached
+    work = tempfile.mkdtemp(prefix="plug-probe-")
+    try:
+        if spec.get("jail"):
+            pkg = opencode_package_dir(binpath)
+            cmd, _ = jail_argv([binpath, "--version"],
+                               ro_binds=((pkg, pkg),) if pkg else ())
+            env, cwd = os.environ.copy(), None
+        else:
+            cmd, env, cwd = [binpath, "--version"], reviewer_env(work), work
+        code, out, _, _ = run_capped(cmd, timeout=AGENT_PROBE_TIMEOUT,
+                                     cap=AGENT_PROBE_BYTES, env=env, cwd=cwd,
+                                     stdin=subprocess.DEVNULL)
+        ok = bool(out.strip())
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    _AGENT_STARTS_CACHE[(key, binpath)] = ok
+    return ok
+
+
 def agent_available(agent_key):
     spec = AGENTS.get(agent_key)
     if not spec:
         return False
     if spec["type"] == "cli":
-        if shutil.which(spec["bin"]) is None:
-            return False
         # An agent that keeps its tools is not offered at all without a jail
         # to put it in.
-        return have_jail() if spec.get("jail") else True
+        if spec.get("jail") and not have_jail():
+            return False
+        binpath = agent_binary(agent_key, spec)
+        return bool(binpath) and agent_starts(agent_key, spec, binpath)
     if spec["type"] == "http":
-        return http_agent_models(spec) is not None
+        # Answering is not the same as having something to answer with: a
+        # server with no model loaded would be offered, chosen, and then fail
+        # at the review. Opencode is held to the same rule below.
+        return bool(http_agent_models(spec))
     return False
 
 
@@ -842,9 +948,10 @@ def available_agents():
     out = []
     for key, spec in AGENTS.items():
         if spec["type"] == "cli":
-            if shutil.which(spec["bin"]) is None:
-                continue
             if spec.get("jail") and not have_jail():
+                continue
+            binpath = agent_binary(key, spec)
+            if not binpath or not agent_starts(key, spec, binpath):
                 continue
             models = spec["models"]
             default = spec["default_model"]
@@ -864,9 +971,9 @@ def available_agents():
                 default = free[0] if free else models[0]
         else:
             models = http_agent_models(spec)
-            if models is None:
+            if not models:
                 continue
-            default = models[0] if models else ""
+            default = models[0]
         out.append({"key": key, "label": spec["label"], "models": models,
                     "defaultModel": default,
                     "private": spec.get("private", False)})
@@ -1143,6 +1250,24 @@ OPENCODE_MODELS_TTL = 24 * 60 * 60
 # the cache exists for — a listing that is slow or unreachable — is the case
 # that retries on every settings open, blocking the reviewer list each time.
 OPENCODE_MODELS_RETRY = 10 * 60
+# The same two bounds for finding Opencode's own program. The lookup reaches
+# the npm registry, and it now runs while the reviewer list is being built, so
+# it is capped well short of the shell waiting on it and a failure is not
+# repeated at every start.
+OPENCODE_BIN_TIMEOUT = 60
+OPENCODE_BIN_RETRY = 10 * 60
+
+
+def stamp_age(stamp):
+    """Seconds since a recorded time, or None if it is unusable. A clock that
+    was ahead when the stamp was written would otherwise make the entry look
+    fresh until real time caught up — and these run at shell start, which on a
+    laptop is before NTP has fixed anything."""
+    try:
+        a = time.time() - float(stamp)
+    except (TypeError, ValueError):
+        return None
+    return a if a >= 0 else None
 
 
 def opencode_models():
@@ -1153,17 +1278,7 @@ def opencode_models():
     the free ones lead and one of them is the default. Nothing is hard-coded:
     the list comes from Opencode itself, cached for a day, and a listing that
     fails keeps the last good answer."""
-    def age(stamp):
-        """Seconds since a recorded time, or None if it is unusable. A clock
-        that was ahead when the stamp was written would otherwise make the
-        entry look fresh until real time caught up — and this runs at shell
-        start, which on a laptop is before NTP has fixed anything."""
-        try:
-            a = time.time() - float(stamp)
-        except (TypeError, ValueError):
-            return None
-        return a if a >= 0 else None
-
+    age = stamp_age
     cached = read_json(OPENCODE_MODELS_FILE, 64 * 1024, {})
     have = []
     if isinstance(cached, dict):
@@ -1210,11 +1325,21 @@ def resolve_opencode_bin():
         p = cached.get("bin", "")
         if isinstance(p, str) and p and os.access(p, os.X_OK):
             return p
-    p = shutil.which("opencode")
+        # A resolution that failed is remembered for a short while. This runs
+        # when the reviewer list is built — at shell start — and the npx
+        # lookup below reaches the network, so a machine that cannot get to
+        # the registry would otherwise pay that wait at every single start.
+        f = stamp_age(cached.get("failedAt"))
+        if f is not None and f < OPENCODE_BIN_RETRY:
+            return ""
+    p = resolve_cli_bin("opencode")
     if not p:
         return ""
     try:
-        if peek_head(p, 2)[:2] != b"#!":
+        # peek_head refuses to follow a symlink, and both npm and mise put a
+        # package's programs in `.bin` as links — so ask about the file the
+        # link names rather than reading the link as a hard failure.
+        if peek_head(os.path.realpath(p), 2)[:2] != b"#!":
             write_atomic(OPENCODE_BIN_FILE, {"bin": p, "resolvedAt": now_iso()})
             return p
     except OSError:
@@ -1225,11 +1350,12 @@ def resolve_opencode_bin():
         ["bash", "-lc",
          'command -v npx >/dev/null 2>&1 || exit 1; '
          'npx --yes --package opencode-ai -- which opencode 2>/dev/null'],
-        timeout=180, cap=64 * 1024)
+        timeout=OPENCODE_BIN_TIMEOUT, cap=64 * 1024)
     line = last_line(out)
     if code == 0 and line and os.access(line, os.X_OK):
         write_atomic(OPENCODE_BIN_FILE, {"bin": line, "resolvedAt": now_iso()})
         return line
+    write_atomic(OPENCODE_BIN_FILE, {"bin": "", "failedAt": time.time()})
     return ""
 
 
@@ -1375,6 +1501,24 @@ def openai_chat(base, model, system, user):
     return ""
 
 
+def reviewer_failed_summary(diff, scan_facts, plugin_name, context, agent,
+                            why):
+    """The offline scan, said honestly: a reviewer was chosen and it did not
+    deliver. The plain summary tells the reader to turn one on in Settings,
+    which is wrong here and reads as their own oversight — and a reviewer that
+    quietly becomes the offline scan is the whole failure this guards."""
+    fb = offline_summary(diff, scan_facts, plugin_name, context)
+    note = ("The AI reviewer you chose (%s) %s, so this is only the offline "
+            "scan." % (agent, why))
+    # Only the benign headline is replaced. Where the scan itself found
+    # something worth flagging, that warning is what belongs at the top — not
+    # the news about the reviewer.
+    if str(fb.get("headline", "")).startswith("No AI reviewer is set up"):
+        fb["headline"] = note
+    fb["watchFor"] = "%s %s" % (note, fb.get("watchFor", ""))
+    return fb
+
+
 def run_agent(diff, scan_facts, plugin_name, context="update",
               install_steps=None):
     """Hand the code to the chosen reviewer and get a plain-English verdict.
@@ -1407,8 +1551,12 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
     if not MODEL_NAME_RE.fullmatch(str(model or "")):
         model = ""
 
-    if agent == "none" or not agent_available(agent):
+    if agent == "none":
         return offline_summary(diff, scan_facts, plugin_name, context)
+    if not agent_available(agent):
+        return reviewer_failed_summary(diff, scan_facts, plugin_name, context,
+                                       agent, "could not be run on this "
+                                       "machine")
 
     if context == "install":
         step_note = ""
@@ -1458,7 +1606,10 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
         if spec.get("type") == "http":
             raw = openai_chat(spec["base"], model, REVIEW_SYSTEM, prompt)
         elif agent == "claude":
-            cmd = ["claude", "-p", "--allowedTools", "",
+            claude_bin = agent_binary(agent, spec)
+            if not claude_bin:
+                raise ValueError("could not find Claude Code's own program to run")
+            cmd = [claude_bin, "-p", "--allowedTools", "",
                    "--permission-mode", "plan",
                    "--append-system-prompt", REVIEW_SYSTEM]
             if model:
@@ -1484,7 +1635,7 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
             finally:
                 shutil.rmtree(empty, ignore_errors=True)
         elif agent == "opencode":
-            binpath = resolve_opencode_bin()
+            binpath = agent_binary(agent, spec)
             if not binpath:
                 raise ValueError("could not find Opencode's own program to run")
             # Never leave the model to Opencode's own default: that is how a
@@ -1533,14 +1684,16 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
             return offline_summary(diff, scan_facts, plugin_name, context)
     except (OSError, subprocess.SubprocessError, urllib.error.URLError,
             ValueError) as e:
-        fb = offline_summary(diff, scan_facts, plugin_name, context)
-        fb["watchFor"] = "The AI reviewer (%s) could not run: %s. %s" % (
-            agent, e, fb["watchFor"])
-        return fb
+        return reviewer_failed_summary(diff, scan_facts, plugin_name, context,
+                                       agent, "could not run (%s)" % e)
     parsed = parse_review(raw)
     parsed["agent"] = agent
     if not parsed["ok"]:
-        fb = offline_summary(diff, scan_facts, plugin_name, context)
+        # It started, and then produced nothing a verdict could be read from —
+        # an expired login, a provider error, a refusal. Saying nothing here
+        # is how a chosen reviewer silently becomes the offline scan.
+        fb = reviewer_failed_summary(diff, scan_facts, plugin_name, context,
+                                     agent, "ran but did not return a verdict")
         fb["raw"] = raw
         return fb
     return parsed

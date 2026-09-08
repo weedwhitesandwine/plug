@@ -1,0 +1,293 @@
+"""Plug reviewer resolution: every defect red first, then green.
+
+A–E  the mise-shim break (the reviewer runs with a throwaway HOME and a cwd
+     outside the real home, where a shim cannot resolve the tool).
+F–H  the three defects the diff review found in the first fix.
+"""
+import os, shutil, subprocess, sys, tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+SHIMS = os.path.expanduser("~/.local/share/mise/shims")
+PATH_SHIM_ONLY = SHIMS + ":/usr/local/sbin:/usr/local/bin:/usr/bin"
+os.environ["PATH"] = PATH_SHIM_ONLY
+
+import plugd
+
+fails = []
+
+
+def check(label, cond, detail=""):
+    print("%-4s %s%s" % ("PASS" if cond else "FAIL", label,
+                         ("  -- " + detail) if detail else ""))
+    if not cond:
+        fails.append(label)
+
+
+def fresh():
+    plugd._CLI_BIN_CACHE.clear()
+
+
+def write_new(path, text, mode=0o600):
+    """Create a fixture file through an exclusively-created descriptor, never
+    by name — the same rule the plugin itself is held to, so a test fixture
+    cannot be written through a planted symlink either."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def as_the_reviewer_runs(binary):
+    work = tempfile.mkdtemp(prefix="plug-review-")
+    try:
+        env = plugd.reviewer_env(work)
+        code, out, err, _ = plugd.run_capped([binary, "--version"], timeout=60,
+                                             cap=64 * 1024, env=env, cwd=work)
+        return out.strip(), err.strip()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+print("== A. RED: the original defect, shim as the only claude on PATH ==")
+fresh()
+old = shutil.which("claude")
+check("old resolution (shutil.which) picks the mise shim",
+      bool(old) and os.path.basename(os.path.realpath(old)) == "mise", str(old))
+out, err = as_the_reviewer_runs(old)
+check("the shim produces no reply for the reviewer", out == "",
+      "stdout=%r" % out)
+
+print()
+print("== B. GREEN: resolved past the shim, same conditions ==")
+fresh()
+new = plugd.resolve_cli_bin("claude")
+check("resolve_cli_bin returns a real binary",
+      bool(new) and os.path.basename(os.path.realpath(new)) != "mise", str(new))
+out, err = as_the_reviewer_runs(new)
+check("it answers where the shim could not", "Claude Code" in out,
+      "stdout=%r" % out)
+
+print()
+print("== C. the agent is offered on a shim-only PATH ==")
+fresh()
+agents = {a["key"]: a for a in plugd.available_agents()}
+check("claude in available_agents()", "claude" in agents, ",".join(agents))
+check("default model is sonnet",
+      agents.get("claude", {}).get("defaultModel") == "sonnet")
+
+print()
+print("== D. fails closed on a shim standing in for nothing ==")
+fresh()
+fake_shims = tempfile.mkdtemp(prefix="plug-shims-")
+try:
+    os.symlink(shutil.which("mise"), os.path.join(fake_shims, "notatool"))
+    os.environ["PATH"] = fake_shims + ":" + PATH_SHIM_ONLY
+    check("returns '' rather than the unusable shim",
+          plugd.resolve_cli_bin("notatool") == "")
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    shutil.rmtree(fake_shims, ignore_errors=True)
+
+print()
+print("== E. a plain binary is returned untouched ==")
+fresh()
+check("resolve_cli_bin('head') is /usr/bin/head",
+      plugd.resolve_cli_bin("head") == shutil.which("head"))
+check("nonexistent name is ''",
+      plugd.resolve_cli_bin("definitely-not-installed-xyz") == "")
+
+print()
+print("== F. a mise.toml in the cwd must not delete the reviewer ==")
+d = tempfile.mkdtemp(prefix="plug-misedir-")
+here = os.getcwd()
+try:
+    write_new(os.path.join(d, "mise.toml"), '[tools]\nclaude = "9.9.9"\n')
+    # RED: asked in that directory, mise cannot resolve the tool at all.
+    code, out, _, _ = plugd.run_capped([shutil.which("mise"), "which", "claude"],
+                                       timeout=30, cap=64 * 1024, cwd=d)
+    check("RED: `mise which` in that directory resolves nothing",
+          plugd.last_line(out) == "" or not os.path.exists(plugd.last_line(out)),
+          "stdout=%r" % out.strip()[:60])
+    # GREEN: plugd asks from / , so the reviewer survives.
+    os.chdir(d)
+    fresh()
+    got = plugd.resolve_cli_bin("claude")
+    check("GREEN: resolve_cli_bin still finds claude", bool(got), got)
+    check("and claude is still offered", plugd.agent_available("claude"))
+finally:
+    os.chdir(here)
+    shutil.rmtree(d, ignore_errors=True)
+
+print()
+print("== G. a symlinked reviewer program is not a hard failure ==")
+link_dir = tempfile.mkdtemp(prefix="plug-link-")
+saved_cache = plugd.OPENCODE_BIN_FILE
+try:
+    real_oc = shutil.which("opencode") or os.path.join(
+        plugd.HOME, ".local/bin/opencode")
+    if not os.path.exists(real_oc):
+        print("SKIP opencode not installed")
+    else:
+        link = os.path.join(link_dir, "opencode")
+        os.symlink(real_oc, link)          # what npm/mise .bin dirs look like
+        # RED: the raw probe refuses to follow a link.
+        raised = False
+        try:
+            plugd.peek_head(link, 2)
+        except OSError:
+            raised = True
+        check("RED: peek_head refuses the symlink outright", raised)
+        # GREEN: resolution now asks about the file the link names.
+        plugd.OPENCODE_BIN_FILE = os.path.join(link_dir, "cache.json")
+        os.environ["PATH"] = link_dir + ":" + PATH_SHIM_ONLY
+        fresh()
+        got = plugd.resolve_opencode_bin()
+        check("GREEN: resolve_opencode_bin still finds the program",
+              bool(got) and os.access(got, os.X_OK), repr(got))
+finally:
+    plugd.OPENCODE_BIN_FILE = saved_cache
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    shutil.rmtree(link_dir, ignore_errors=True)
+
+print()
+print("== M. the probe uses the reviewer's environment, not your shell's ==")
+# A probe that ran in the real environment would pass things that break the
+# moment a review strips it — which is the entire original bug.
+env_dir = tempfile.mkdtemp(prefix="plug-envtest-")
+try:
+    fake = os.path.join(env_dir, "claude")
+    write_new(fake, '#!/bin/sh\n[ "$HOME" = "%s" ] && echo "9.9.9 (Claude "'
+                    '"Code)"\nexit 0\n' % plugd.HOME, 0o755)
+    os.environ["PATH"] = env_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    plugd._AGENT_STARTS_CACHE.clear()
+    code, out, _, _ = plugd.run_capped([fake, "--version"], timeout=20,
+                                       cap=4096)
+    check("RED: it answers happily when run with your real HOME",
+          "Claude" in out, repr(out.strip()))
+    check("GREEN: the probe still refuses it, because a review has no real HOME",
+          not plugd.agent_available("claude"))
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    plugd._AGENT_STARTS_CACHE.clear()
+    shutil.rmtree(env_dir, ignore_errors=True)
+
+print()
+print("== L. the review executes the RESOLVED binary, not the bare name ==")
+fresh()
+plugd.resolve_cli_bin("claude")          # warm before run_capped is stubbed
+seen = {}
+sv_rc, sv_ls, sv_av = plugd.run_capped, plugd.load_settings, plugd.agent_available
+try:
+    plugd.load_settings = lambda: {"reviewAgent": "claude",
+                                   "reviewModel": "sonnet"}
+    plugd.agent_available = lambda k: True
+
+    def spy(cmd, *a, **kw):
+        seen.setdefault("cmd", list(cmd))
+        return (0, "", "", False)
+    plugd.run_capped = spy
+    plugd.run_agent("diff --git a b\n+x\n", {}, "TestPlugin")
+    argv0 = (seen.get("cmd") or [""])[0]
+    check("RED: it is not the bare name 'claude'", argv0 != "claude", argv0)
+    check("GREEN: it is the resolved, executable path",
+          os.path.isabs(argv0) and os.access(argv0, os.X_OK), argv0)
+finally:
+    plugd.run_capped, plugd.load_settings, plugd.agent_available = \
+        sv_rc, sv_ls, sv_av
+
+print()
+print("== H. an unrunnable chosen reviewer is named, not blamed on the user ==")
+saved = plugd.agent_available
+saved_ls = plugd.load_settings
+try:
+    plugd.load_settings = lambda: {"reviewAgent": "claude",
+                                   "reviewModel": "sonnet"}
+    plugd.agent_available = lambda k: False
+    plain = plugd.offline_summary("diff --git a b\n+x\n", {}, "TestPlugin")
+    res = plugd.run_agent("diff --git a b\n+x\n", {}, "TestPlugin")
+    check("RED: the plain offline summary never names the reviewer",
+          "could not be run" not in plain.get("watchFor", ""))
+    check("GREEN: run_agent's watchFor says the chosen reviewer did not run",
+          "could not be run" in res.get("watchFor", ""),
+          res.get("watchFor", "")[:80])
+    check("and it names which one", "claude" in res.get("watchFor", ""))
+    check("the headline no longer blames the user for not setting one up",
+          not str(res.get("headline", "")).startswith("No AI reviewer is set up"),
+          str(res.get("headline", ""))[:70])
+finally:
+    plugd.agent_available = saved
+    plugd.load_settings = saved_ls
+
+print()
+print("== K. a reviewer that resolves but cannot START is not offered ==")
+# The property that matters is not "on PATH", it is "runs the way a review
+# runs it". A command that resolves and then produces nothing must not be
+# offered, whatever the mechanism that breaks it.
+dud_dir = tempfile.mkdtemp(prefix="plug-dud-")
+try:
+    dud = os.path.join(dud_dir, "claude")
+    write_new(dud, "#!/bin/sh\nexit 0\n", 0o755)   # resolves, says nothing
+    os.environ["PATH"] = dud_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    plugd._AGENT_STARTS_CACHE.clear()
+    check("RED: it resolves — presence alone would have offered it",
+          plugd.resolve_cli_bin("claude") == dud, plugd.resolve_cli_bin("claude"))
+    check("GREEN: agent_available says no, because it did not start",
+          not plugd.agent_available("claude"))
+    check("and it is absent from available_agents()",
+          "claude" not in {a["key"] for a in plugd.available_agents()})
+
+    # A command that resolves and DOES answer is still offered.
+    write_new(dud, "#!/bin/sh\necho '9.9.9 (Claude Code)'\n", 0o755)
+    fresh()
+    plugd._AGENT_STARTS_CACHE.clear()
+    check("a reviewer that answers is offered again",
+          plugd.agent_available("claude"))
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    plugd._AGENT_STARTS_CACHE.clear()
+    shutil.rmtree(dud_dir, ignore_errors=True)
+
+print()
+print("== I. a local server with no model loaded is not offered ==")
+saved_http = plugd.http_agent_models
+try:
+    plugd.http_agent_models = lambda spec: []      # answering, nothing loaded
+    check("agent_available('ollama') is False", not plugd.agent_available("ollama"))
+    check("ollama absent from available_agents()",
+          "ollama" not in {a["key"] for a in plugd.available_agents()})
+    plugd.http_agent_models = lambda spec: ["a-model"]
+    check("offered again once a model is loaded",
+          plugd.agent_available("ollama"))
+    got = {a["key"]: a for a in plugd.available_agents()}
+    check("and its default is that model",
+          got.get("ollama", {}).get("defaultModel") == "a-model")
+    plugd.http_agent_models = lambda spec: None    # not listening
+    check("still not offered when nothing is listening",
+          not plugd.agent_available("ollama"))
+finally:
+    plugd.http_agent_models = saved_http
+
+print()
+print("== J. the real local servers, as they are right now ==")
+for key in ("ollama", "lmstudio"):
+    m = plugd.http_agent_models(plugd.AGENTS[key])
+    print("     %-9s %s models=%s" % (
+        key, "answering " if m is not None else "not running", m))
+live = {a["key"]: a for a in plugd.available_agents()}
+print("     offered:", ", ".join("%s(%s)" % (k, v["defaultModel"])
+                                 for k, v in live.items()))
+check("every offered agent has a usable default model",
+      all(a["defaultModel"] for a in live.values()))
+
+print()
+print("FAILURES: %d" % len(fails), fails or "")
+sys.exit(1 if fails else 0)
