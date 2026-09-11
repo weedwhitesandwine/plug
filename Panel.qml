@@ -331,12 +331,13 @@ Item {
     }
   }
   // Last resort for a detached runner that dies without reporting. Sized
-  // above the slowest job's worst case — an install clones over the network —
+  // above the slowest job's worst case — an install is a bounded clone (300 s)
+  // followed by `omarchy plugin add` (300 s) and the switch-on retries —
   // because releasing the guard early reopens the corridor it exists to
   // close.
   Timer {
     id: jobWatchdog
-    interval: 180000
+    interval: 660000
     onTriggered: {
       toggleProc.running = false
       root.clearJob(); root.refreshAll()
@@ -433,7 +434,7 @@ Item {
   // The install carries the commit that was actually read: an address points
   // at whatever is there when something looks, a commit is the code the
   // reviewer judged.
-  function approveUpdate(approvedVersion) {
+  function approveUpdate() {
     if (!root.reviewId) return
     if (root.reviewMode === "install") {
       var c = root.installCandidate
@@ -446,10 +447,8 @@ Item {
       if (repo) {
         root.lastApproved = { repo: repo, name: nm, sha: sha, id: pid,
                               candidate: c }
-        var args = ["install", String(repo).replace(/\.git$/, "") + ".git",
-                    nm, sha, pid]
-        if (approvedVersion === true) args.push("--approved-version")
-        root.runJob(args, "Installing " + nm + "…", pid)
+        root.runJob(["install", String(repo).replace(/\.git$/, "") + ".git",
+                     nm, sha, pid], "Installing " + nm + "…", pid)
       }
       return
     }
@@ -475,14 +474,15 @@ Item {
     root.runJob(["rollback", id], "Restoring…", id)
   }
 
-  // The author pushed after the review; take the version that was read.
+  // The author pushed after the review; take the version that was read —
+  // the engine installs that commit and never checks out the newer one.
   function installApproved() {
     var a = root.lastApproved
     root.movedName = ""; root.movedSha = ""
     if (!a || !a.repo) return
     root.runJob(["install", String(a.repo).replace(/\.git$/, "") + ".git",
                  a.name, a.sha, a.id,
-                 "--approved-version"], "Installing the version you approved…", a.id)
+                 "--even-if-moved"], "Installing the version you checked…", a.id)
   }
   // Or read the newer code instead — the same review, on what is there now.
   function reviewMoved() {

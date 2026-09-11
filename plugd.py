@@ -90,6 +90,10 @@ GIT_TIMEOUT = 25
 MAX_GIT_BYTES = 256 * 1024
 MAX_CLONE_BYTES = 64 * 1024 * 1024
 CLONE_TIMEOUT = 90
+# An install lands the whole branch on disk, which the shallow review ceiling
+# was never sized for; still bounded, just wider.
+MAX_INSTALL_BYTES = 256 * 1024 * 1024
+INSTALL_CLONE_TIMEOUT = 300
 CLAUDE_TIMEOUT = 180
 MAX_AGENT_BYTES = 512 * 1024
 MAX_SETTINGS_BYTES = 64 * 1024
@@ -1884,21 +1888,26 @@ def dir_bytes(path, ceiling):
     return total
 
 
-def clone_bounded(workdir, url, dest, ceiling=MAX_CLONE_BYTES):
+def clone_bounded(workdir, url, dest, ceiling=MAX_CLONE_BYTES, depth=1,
+                  timeout=CLONE_TIMEOUT):
     """Clone a stranger's repository with the disk ceiling enforced while it
-    arrives, not measured afterwards."""
+    arrives, not measured afterwards. `depth=None` fetches every branch in
+    full, which an install needs so the reviewed commit is there to pin to
+    even if the default branch has moved on or been renamed since."""
     cmd = ["git", "-C", workdir,
            "-c", "core.hooksPath=/dev/null",
            "-c", "protocol.ext.allow=never",
            "-c", "protocol.file.allow=user",
-           "clone", "--depth", "1", "--no-tags", "--single-branch",
-           "--", url, dest]
+           "clone", "--no-tags"]
+    if depth:
+        cmd += ["--depth", str(depth), "--single-branch"]
+    cmd += ["--", url, dest]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, env=git_env())
     except OSError:
         return 1, "git invocation failed"
-    deadline = time.time() + CLONE_TIMEOUT
+    deadline = time.time() + timeout
     while proc.poll() is None:
         if dir_bytes(dest, ceiling) > ceiling:
             proc.kill()
@@ -1916,20 +1925,6 @@ def clone_bounded(workdir, url, dest, ceiling=MAX_CLONE_BYTES):
         return 1, ("repository is larger than %d MB — refusing to read it"
                    % (ceiling // (1024 * 1024)))
     return proc.returncode, err
-
-
-def remote_head(url, ref="HEAD"):
-    """What the repository is at right now, without downloading it."""
-    if not REPO_URL_RE.match(str(url or "")):
-        return ""
-    code, out, _ = git(HOME, "ls-remote", "--", url, ref, cap=64 * 1024)
-    if code != 0:
-        return ""
-    for line in out.split("\n"):
-        parts = line.split()
-        if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40}", parts[0]):
-            return parts[0]
-    return ""
 
 
 def inspect_repo(url):
@@ -2249,61 +2244,92 @@ def read_landed_id(manifest_path):
 
 
 def job_install(url, name, sha, pid, approved):
-    """Install from the store, bound to the commit that was reviewed: check
-    the repository has not moved, add switched off, verify what landed, pin
-    it if needed, and only then switch it on."""
-    if not sha:
+    """Install from the store, bound to the commit that was reviewed.
+
+    The repository is cloned into a private staging copy, that copy is pinned
+    to the reviewed commit before anything reads it, and only the pinned copy
+    is handed to `omarchy plugin add` — so the code Omarchy validates, rescans
+    and later switches on is the code that was read, whatever the repository's
+    HEAD has become since. The repository itself is never checked out into the
+    plugins directory. `approved` means "the reviewed commit even though the
+    author has pushed since"; nothing it skips is a check on what lands."""
+    if not re.fullmatch(r"[0-9a-f]{40}", str(sha or "")):
         finish(error="nothing was installed: no reviewed version was recorded for it")
         return
-    head = remote_head(url)
-    if not head:
-        finish(error="could not reach the repository to check it")
+    if not pid or not valid_plugin_id(pid):
+        finish(error="nothing was installed: its plugin id was unknown, so the version could not be checked")
         return
-    if head != sha and not approved:
-        # Nothing was installed; the panel offers the choice.
-        finish(moved={"name": name or "That plugin", "sha": head})
+    if not REPO_URL_RE.match(str(url or "")):
+        finish(error="nothing was installed: not a plugin repository address")
         return
+
+    tmp = tempfile.mkdtemp(prefix="plug-install-")
+    try:
+        stage = os.path.join(tmp, "src")
+        code, cerr = clone_bounded(tmp, url, stage, ceiling=MAX_INSTALL_BYTES,
+                                   depth=None, timeout=INSTALL_CLONE_TIMEOUT)
+        if code != 0:
+            finish(error=last_line(cerr) or "could not clone the repository")
+            return
+        _, head, _ = git(stage, "rev-parse", "HEAD")
+        code, kind, _ = git(stage, "cat-file", "-t", sha)
+        if code != 0 or kind != "commit":
+            finish(error="the version you checked is no longer in the repository — nothing was installed; check it again")
+            return
+        if head != sha and not approved:
+            # Nothing was installed; the panel offers the choice.
+            finish(moved={"name": name or "That plugin", "sha": head})
+            return
+        # Pin the staging copy to the reviewed commit, and refuse unless it
+        # demonstrably got there, before Omarchy reads a byte of it.
+        code, _, _ = git(stage, "reset", "--hard", sha)
+        _, pinned, _ = git(stage, "rev-parse", "HEAD")
+        if code != 0 or pinned != sha:
+            finish(error="could not pin the copy to the version you checked — nothing was installed")
+            return
+        if read_landed_id(os.path.join(stage, "manifest.json")) != pid:
+            finish(error="the version you checked does not carry the plugin id that was reviewed — nothing was installed")
+            return
+        # Omarchy clones from the pinned copy, not from the repository, so
+        # what it validates and rescans is the reviewed commit by
+        # construction; the copy is deleted once it has.
+        code, out, cmderr, _ = run_capped(["omarchy", "plugin", "add",
+                                           "file://" + stage, "--yes"],
+                                          timeout=300, cap=MAX_GIT_BYTES)
+        add_err = "" if code == 0 else (last_line(out + "\n" + cmderr)
+                                        or "omarchy plugin add failed")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     err = ""
-    code, out, cmderr, _ = run_capped(["omarchy", "plugin", "add", url, "--yes"],
-                                      timeout=300, cap=MAX_GIT_BYTES)
-    if code != 0:
-        err = last_line(out + "\n" + cmderr) or "omarchy plugin add failed"
-
-    if not err and not pid:
-        err = "installed, but its plugin id was unknown so the version could not be checked"
-    if not err and not valid_plugin_id(pid):
-        err = "installed, but its plugin id is not a valid id, so the version could not be checked"
-    if not err:
-        d = os.path.join(PLUGINS_DIR, pid)
-        # The reviewed manifest and the fetched manifest can disagree on the
-        # id; the directory's own manifest is the authority on whose
-        # directory this is before anything is reset or removed in it.
-        landed = read_landed_id(os.path.join(d, "manifest.json"))
-        if os.path.isdir(os.path.join(d, ".git")) and landed != pid:
-            err = "installed, but it did not arrive under the id that was reviewed — nothing was changed"
-        elif not os.path.isdir(os.path.join(d, ".git")):
-            err = "installed, but %s is not where it was expected, so the version could not be checked" % pid
-        else:
-            _, headsha, _ = git(d, "rev-parse", "HEAD")
-            if headsha != sha:
-                code, kind, _ = git(d, "cat-file", "-t", sha)
-                ok = code == 0 and kind == "commit"
-                if ok:
-                    code, _, _ = git(d, "reset", "--hard", sha)
-                    ok = code == 0
-                if ok:
-                    _, headsha, _ = git(d, "rev-parse", "HEAD")
-                    ok = headsha == sha
-                if not ok:
-                    run_capped(["omarchy", "plugin", "remove", pid, "--yes"],
-                               timeout=120, cap=MAX_GIT_BYTES)
-                    err = "what arrived was not the version you approved — nothing was installed"
+    d = os.path.join(PLUGINS_DIR, pid)
+    # The directory's own manifest is the authority on whose directory this is
+    # before anything is removed in it. `omarchy plugin add` moves the clone
+    # into place before it asks the shell to rescan, so a failure it reports
+    # can still have landed the plugin: what is on disk decides, not the exit
+    # code.
+    landed = read_landed_id(os.path.join(d, "manifest.json"))
+    if not os.path.isdir(os.path.join(d, ".git")) or landed != pid:
+        err = add_err or ("installed, but it did not arrive under the id that "
+                          "was reviewed — nothing was changed")
+    else:
+        # The clone's origin is the staging copy, which is gone; point it at
+        # the repository first, whatever else is wrong, so `omarchy plugin
+        # update` and the update check have somewhere to fetch from.
+        code, _, _ = git(d, "remote", "set-url", "origin", url)
+        _, headsha, _ = git(d, "rev-parse", "HEAD")
+        if headsha != sha:
+            run_capped(["omarchy", "plugin", "remove", pid, "--yes"],
+                       timeout=120, cap=MAX_GIT_BYTES)
+            err = "what arrived was not the version you checked — it was removed again"
+        elif code != 0:
+            err = ("installed at the version you checked, but its repository "
+                   "address could not be recorded, so updates will not be found")
 
     if not err:
         # On, only now that what landed is confirmed to be what was read. The
-        # pin rewrites files, which makes the shell disable the plugin, so the
-        # switch-on is retried and confirmed rather than assumed.
+        # shell may still be rescanning, so the switch-on is retried and
+        # confirmed rather than assumed.
         for _ in range(6):
             time.sleep(0.6)
             if is_on(pid):
@@ -2365,8 +2391,8 @@ def run_job(args):
     elif verb in ("apply", "rollback") and rest:
         job_apply(verb, rest[0])
     elif verb == "install" and rest:
-        approved = "--approved-version" in rest
-        rest = [a for a in rest if a != "--approved-version"]
+        approved = "--even-if-moved" in rest
+        rest = [a for a in rest if a != "--even-if-moved"]
         url = rest[0]
         name = rest[1] if len(rest) > 1 else url
         sha = rest[2] if len(rest) > 2 else ""
@@ -2384,7 +2410,7 @@ def run_job(args):
 # --------------------------------------------------- cli
 
 def main():
-    # Job arguments carry flags like --attached and --approved-version, which
+    # Job arguments carry flags like --attached and --even-if-moved, which
     # an argument parser would claim as its own options; they go straight
     # through.
     if len(sys.argv) > 1 and sys.argv[1] == "job":

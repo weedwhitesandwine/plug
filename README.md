@@ -59,7 +59,14 @@ English, whether it is safe.
   throwaway directory, scans what it can do, has your reviewer read the whole
   source, and tells you plainly whether it looks safe — then you decide, with
   the button reading **Install anyway** if the answer was no. The copy is
-  deleted either way, and nothing in it is ever run. Double-click a row to open
+  deleted either way, and nothing in it is ever run. When you do install, Plug
+  clones the repository again into a private copy, pins that copy to the exact
+  commit you read, and hands the pinned copy to `omarchy plugin add` — so the
+  code Omarchy validates, loads and switches on is that commit, whatever the
+  repository holds by then. If the author has pushed since, Plug says so
+  before anything lands and lets you choose between the version you read and
+  reading the new one; if the commit you read has been rewritten away, nothing
+  is installed. Double-click a row to open
   the plugin's own repository page. Omarchy's built-in plugins appear here too,
   marked **OFFICIAL** and shown for discovery only.
 - **Any repository, listed or not** — paste a GitHub address into the Store's
@@ -171,7 +178,7 @@ again on every settings open).
 | `~/.config/hypr/bindings.lua` | only when you set or clear a hotkey, and only Plug's own marked block, between `-- >>> plug hotkey` and `-- <<< plug hotkey`, along with the blank line it writes above that block. Resolved the same way if it is a dotfiles symlink |
 | `~/.config/omarchy/shell.json` | only when you show or hide the bar icon. It adds, moves or removes its own `{"id": …}` entry and leaves every other setting as it found it, though the file is rewritten as standard JSON with two-space indentation. Where a dotfiles manager has symlinked this path into its own repository, the link is resolved and the real file written, so the link survives |
 | a plugin's own checkout under `~/.config/omarchy/plugins/…` | `git fetch` against every installed plugin's remote each time the panel opens (the update check, which you can turn off with `autoCheck`) and each time you press **Check for updates**; and, for the one plugin you act on, a fast-forward when you update it or a `reset` when you restore it |
-| a temporary directory | two things, both read and then deleted: a shallow clone of a plugin you asked Plug to check before installing, and — when you review an update — a copy of the incoming version's files extracted from the plugin's own repository, so the reviewer reads the new code rather than only the diff |
+| a temporary directory | three things, all deleted afterwards: a shallow clone of a plugin you asked Plug to check before installing; when you install, a clone of that repository's default branch pinned to the commit you read, which is what `omarchy plugin add` copies from; and — when you review an update — a copy of the incoming version's files extracted from the plugin's own repository, so the reviewer reads the new code rather than only the diff |
 
 **Commands it runs:** `python3` (Plug's own engine, `plugd.py` — every job
 goes through it); `omarchy-shell shell listPlugins` / `listShellConfig` /
@@ -282,6 +289,12 @@ shell process that stays up for days, so all of it is treated as data:
 - A plugin you ask Plug to check before installing is cloned shallow into a
   throwaway directory, read, and deleted — whether the check succeeds or not.
   Nothing in it is executed at any point.
+- An install is bound to the commit that was read, not to the repository
+  address: the staging clone is reset to that commit and its `HEAD` compared
+  before `omarchy plugin add` reads it, the installed checkout's `HEAD` is
+  compared again afterwards and removed on a mismatch, and a commit that is
+  no longer in the repository is refused. The repository's current `HEAD` is
+  never checked out into the plugins directory.
 - Source files are picked by what they are, not what they are called: a script
   with no extension is opened far enough to read its shebang, since the file
   that does the most to your machine is often named plainly `setup`.
