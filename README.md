@@ -110,8 +110,9 @@ tools you actually have:
   code before it runs. It asks `mise` instead, which reports only what is
   already installed — so on a machine where you have used Opencode even once,
   it is found and offered. If nothing is installed yet, Opencode is not in the
-  list; run `opencode` once in a terminal, or `mise use -g opencode`, and it
-  is there from the next shell start.
+  list and Settings says so, with the command to install it; run `opencode`
+  once in a terminal, or `mise use -g opencode`, and it is there from the next
+  shell start.
 - **Local servers** — Ollama or LM Studio, if they are running. The review is a
   request to `localhost`, so **nothing leaves your machine** — a real LLM review
   that is completely private. Their loaded models are listed automatically.

@@ -294,6 +294,30 @@ finally:
     shutil.rmtree(mise_dir, ignore_errors=True)
 
 print()
+print("== G5. a reviewer missing for a fixable reason says so ==")
+# A stand-in on PATH means Opencode looks installed and is not offered, which
+# without a word on screen reads as Plug being broken.
+hint_dir = tempfile.mkdtemp(prefix="plug-hint-")
+try:
+    write_new(os.path.join(hint_dir, "opencode"),
+              '#!/bin/bash\nmise use -g --quiet "opencode" || exit 1\n', 0o755)
+    os.environ["PATH"] = hint_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    hints = plugd.agent_hints([{"key": "claude"}])
+    check("RED: Opencode is not among the offered reviewers",
+          "opencode" not in {a["key"] for a in plugd.available_agents()})
+    check("GREEN: a hint explains why", len(hints) == 1, str(hints)[:80])
+    check("and it carries a command to fix it",
+          bool(hints) and bool(hints[0].get("command")),
+          hints[0].get("command") if hints else "")
+    check("no hint once Opencode is offered",
+          plugd.agent_hints([{"key": "opencode"}]) == [])
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    shutil.rmtree(hint_dir, ignore_errors=True)
+
+print()
 print("== N. a state file an older version wrote does not survive the upgrade ==")
 # The README lists what Plug keeps on disk and invites people to check it, so
 # a file left behind by a previous version makes that list wrong.

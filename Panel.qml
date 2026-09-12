@@ -114,6 +114,7 @@ Item {
   property var settings: ({ reviewAgent: "claude", reviewModel: "sonnet",
                             autoCheck: true, autoCatalog: true })
   property var availableAgents: []
+  property var agentHints: []
   property bool settingsLoaded: false
 
   // ------------------------------------------------------------ the engine
@@ -693,7 +694,16 @@ Item {
   Engine {
     id: agentsEngine
     sub: "agents"
-    onResult: function(a) { if (Array.isArray(a)) root.availableAgents = a }
+    // An array is what older engines answered with; both shapes are read so a
+    // reload that pairs a new panel with an engine mid-update does not blank
+    // the reviewer list.
+    onResult: function(a) {
+      if (Array.isArray(a)) { root.availableAgents = a; root.agentHints = [] }
+      else if (a && typeof a === "object") {
+        root.availableAgents = Array.isArray(a.agents) ? a.agents : []
+        root.agentHints = Array.isArray(a.hints) ? a.hints : []
+      }
+    }
   }
   function saveSettings() {
     if (!root.settingsLoaded) return
@@ -2090,6 +2100,77 @@ Item {
               }
             }
           }
+          // A reviewer missing for a reason the user can do something about.
+          // Without this the entry is simply absent, which reads as Plug being
+          // broken rather than as a program that is not installed.
+          Repeater {
+            model: root.agentHints
+            delegate: Rectangle {
+              width: card.width - Style.space(60)
+              height: hintCol.implicitHeight + Style.space(16)
+              radius: root.cornerRadius
+              color: "transparent"
+              border.color: root.hairline; border.width: 1
+              Column {
+                id: hintCol
+                x: Style.space(10); y: Style.space(8)
+                width: parent.width - Style.space(20)
+                spacing: Style.space(4)
+                Text {
+                  width: parent.width
+                  text: modelData.title
+                  textFormat: Text.PlainText
+                  wrapMode: Text.WordWrap
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  width: parent.width
+                  text: modelData.body
+                  textFormat: Text.PlainText
+                  wrapMode: Text.WordWrap
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  spacing: Style.space(6)
+                  Text {
+                    text: modelData.command
+                    textFormat: Text.PlainText
+                    height: Style.space(24)
+                    verticalAlignment: Text.AlignVCenter
+                    color: root.foreground
+                    font.family: root.monoFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  Rectangle {
+                    width: hintCopy.implicitWidth + Style.space(16)
+                    height: Style.space(24)
+                    radius: root.cornerRadius
+                    color: "transparent"
+                    border.color: root.hairline; border.width: 1
+                    Text {
+                      id: hintCopy
+                      anchors.centerIn: parent
+                      text: "Copy"
+                      textFormat: Text.PlainText
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.copyText(modelData.command)
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           // A Flow, so a long local-model name wraps instead of running off
           // the panel.
           Flow {

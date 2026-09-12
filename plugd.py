@@ -977,6 +977,40 @@ def agent_available(agent_key):
     return False
 
 
+def agent_hints(agents):
+    """Why a reviewer that plainly could be here is not.
+
+    Only for the case where the reason is invisible and the user can act on it.
+    Opencode disappearing is exactly that: Omarchy puts a stand-in on PATH that
+    installs the program when it runs, so `opencode` looks installed, works in
+    a terminal, and is still not something Plug will run — and without a word
+    on screen that reads as Plug being broken rather than as a missing
+    install."""
+    if "opencode" in {a["key"] for a in agents}:
+        return []
+    p = shutil.which("opencode")
+    if not p:
+        return []
+    try:
+        real = os.path.realpath(p)
+        if peek_head(real, 2)[:2] != b"#!" or opencode_package_dir(real) != real:
+            return []
+    except OSError:
+        return []
+    if not have_jail():
+        return [{"title": "Opencode needs bubblewrap",
+                 "body": "Opencode keeps its own tools, so Plug only runs it "
+                         "inside a sandbox. Install bubblewrap and it appears "
+                         "here.",
+                 "command": "omarchy pkg add bubblewrap"}]
+    return [{"title": "Opencode is not installed",
+             "body": "What `opencode` runs on this machine downloads Opencode "
+                     "each time rather than being it, and Plug will not fetch "
+                     "a program in order to run a review. Install it once and "
+                     "it appears here.",
+             "command": "mise use -g opencode"}]
+
+
 def available_agents():
     """Only reviewers actually usable right now: installed CLIs and local
     servers that answer."""
@@ -2481,7 +2515,8 @@ def main():
         except Exception as e:
             print(json.dumps({"ok": False, "error": str(e)[:200]}))
     elif args.cmd == "agents":
-        print(json.dumps(available_agents()))
+        agents = available_agents()
+        print(json.dumps({"agents": agents, "hints": agent_hints(agents)}))
     elif args.cmd == "outcome":
         print(json.dumps(take_outcome()))
     elif args.cmd == "print-settings":
