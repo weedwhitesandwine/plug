@@ -889,9 +889,18 @@ def mise_which(name, mise_bin=""):
     code, out, _, _ = run_capped([m, "which", name], timeout=30,
                                  cap=64 * 1024, cwd="/", env=env)
     line = last_line(out)
-    if code == 0 and line and os.access(line, os.X_OK):
-        return line
-    return ""
+    if code != 0 or not line or not os.access(line, os.X_OK):
+        return ""
+    # Resolved, because mise answers with a version alias: it installs to
+    # `installs/<tool>/<version>/` and points `latest` at it. The sandbox is
+    # given the tree the program is really in, so handing back the alias binds
+    # one path and executes another — measured as `bwrap: execvp …/latest/…:
+    # No such file or directory`, an empty probe, and the reviewer silently
+    # never offered. Bind what you execute.
+    try:
+        return os.path.realpath(line)
+    except OSError:
+        return ""
 
 
 # A stand-in is a few lines long and fetching is its whole purpose, so the head

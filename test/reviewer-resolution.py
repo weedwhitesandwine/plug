@@ -168,7 +168,12 @@ try:
               '#!/bin/bash\npackage="opencode-ai"\n'
               'bin=$(npx --yes --package "$package" -- which opencode)\n'
               'exec "$bin" "$@"\n', 0o755)
-    os.environ["PATH"] = wrap_dir + ":" + PATH_SHIM_ONLY
+    # A mise that has nothing installed, so the section tests the stand-in
+    # rule rather than whatever the machine running it happens to have.
+    write_new(os.path.join(wrap_dir, "mise"),
+              '#!/bin/sh\nif [ "$1" = "which" ]; then exit 1; fi\n'
+              'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n', 0o755)
+    os.environ["PATH"] = wrap_dir + ":/usr/local/bin:/usr/bin"
     fresh()
     ran = []
     sv_rc = plugd.run_capped
@@ -254,10 +259,15 @@ print("== G4. a fetching stand-in still finds a program mise has installed ==")
 # mise is asked instead, and it must be asked in a way that cannot install.
 mise_dir = tempfile.mkdtemp(prefix="plug-mise-")
 try:
-    installed = os.path.join(mise_dir, "installs", "opencode", "bin")
-    os.makedirs(installed)
-    program = os.path.join(installed, "opencode")
+    # mise's real layout: installs/<tool>/<version>/, with `latest` pointed at
+    # it. `mise which` answers with the alias, so a resolution that hands the
+    # alias back binds one path and executes another.
+    versioned = os.path.join(mise_dir, "installs", "opencode", "1.18.30")
+    os.makedirs(versioned)
+    program = os.path.join(versioned, "opencode")
     write_new(program, '#!/bin/sh\necho "1.18.30"\n', 0o755)
+    os.symlink("./1.18.30", os.path.join(mise_dir, "installs", "opencode", "latest"))
+    alias = os.path.join(mise_dir, "installs", "opencode", "latest", "opencode")
 
     stub_dir = os.path.join(mise_dir, "bin")
     os.makedirs(stub_dir)
@@ -273,7 +283,7 @@ try:
               '  case "$MISE_AUTO_INSTALL" in 0|false) ;; *) echo "AUTOINSTALL-ALLOWED" >&2; exit 3;; esac\n'
               '  echo "%s"; exit 0\n'
               'fi\n'
-              'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n' % program, 0o755)
+              'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n' % alias, 0o755)
     os.environ["PATH"] = stub_dir + ":" + PATH_SHIM_ONLY
     fresh()
     got = plugd.resolve_cli_bin("opencode")
@@ -281,6 +291,8 @@ try:
           os.path.basename(str(shutil.which("opencode"))) == "opencode"
           and shutil.which("opencode").startswith(stub_dir), str(shutil.which("opencode")))
     check("GREEN: the installed program is found anyway", got == program, repr(got))
+    check("GREEN: the version alias is resolved, so the sandbox can exec it",
+          got != alias and plugd.package_dir(got) == got, repr(got))
     # The stub refuses to answer unless installing was turned off, and accepts
     # either spelling mise parses, so the check tests the guard rather than the
     # literal chosen to express it.
@@ -308,7 +320,12 @@ hint_dir = tempfile.mkdtemp(prefix="plug-hint-")
 try:
     write_new(os.path.join(hint_dir, "opencode"),
               '#!/bin/bash\nmise use -g --quiet "opencode" || exit 1\n', 0o755)
-    os.environ["PATH"] = hint_dir + ":" + PATH_SHIM_ONLY
+    # A mise that has nothing installed, so the section tests the stand-in
+    # rule rather than whatever the machine running it happens to have.
+    write_new(os.path.join(hint_dir, "mise"),
+              '#!/bin/sh\nif [ "$1" = "which" ]; then exit 1; fi\n'
+              'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n', 0o755)
+    os.environ["PATH"] = hint_dir + ":/usr/local/bin:/usr/bin"
     fresh()
     hints = plugd.agent_hints([{"key": "claude"}])
     check("RED: Opencode is not among the offered reviewers",
