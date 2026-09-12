@@ -3,6 +3,8 @@
 A–E  the mise-shim break (the reviewer runs with a throwaway HOME and a cwd
      outside the real home, where a shim cannot resolve the tool).
 F–H  the three defects the diff review found in the first fix.
+G2   the package-fetch blocker: a wrapper on PATH must resolve to nothing
+     rather than to a program downloaded to satisfy it.
 """
 import os, shutil, subprocess, sys, tempfile
 
@@ -125,34 +127,141 @@ finally:
 
 print()
 print("== G. a symlinked reviewer program is not a hard failure ==")
+# An installed node package puts its programs in a `.bin` directory as links,
+# so refusing every symlink would refuse the ordinary install.
 link_dir = tempfile.mkdtemp(prefix="plug-link-")
-saved_cache = plugd.OPENCODE_BIN_FILE
 try:
-    real_oc = shutil.which("opencode") or os.path.join(
-        plugd.HOME, ".local/bin/opencode")
-    if not os.path.exists(real_oc):
-        print("SKIP opencode not installed")
-    else:
-        link = os.path.join(link_dir, "opencode")
-        os.symlink(real_oc, link)          # what npm/mise .bin dirs look like
-        # RED: the raw probe refuses to follow a link.
-        raised = False
-        try:
-            plugd.peek_head(link, 2)
-        except OSError:
-            raised = True
-        check("RED: peek_head refuses the symlink outright", raised)
-        # GREEN: resolution now asks about the file the link names.
-        plugd.OPENCODE_BIN_FILE = os.path.join(link_dir, "cache.json")
-        os.environ["PATH"] = link_dir + ":" + PATH_SHIM_ONLY
-        fresh()
-        got = plugd.resolve_opencode_bin()
-        check("GREEN: resolve_opencode_bin still finds the program",
-              bool(got) and os.access(got, os.X_OK), repr(got))
+    real_prog = shutil.which("head")     # a real binary, not a `#!` script
+    link = os.path.join(link_dir, "opencode")
+    os.symlink(real_prog, link)          # what npm/mise .bin dirs look like
+    # RED: the raw probe refuses to follow a link.
+    raised = False
+    try:
+        plugd.peek_head(link, 2)
+    except OSError:
+        raised = True
+    check("RED: peek_head refuses the symlink outright", raised)
+    # GREEN: resolution asks about the file the link names, and returns it.
+    os.environ["PATH"] = link_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    got = plugd.resolve_opencode_bin()
+    check("GREEN: resolve_opencode_bin still finds the program",
+          got == real_prog and os.access(got, os.X_OK), repr(got))
 finally:
-    plugd.OPENCODE_BIN_FILE = saved_cache
     os.environ["PATH"] = PATH_SHIM_ONLY
     shutil.rmtree(link_dir, ignore_errors=True)
+
+print()
+print("== G2. a wrapper on PATH is refused, and NOTHING is fetched to fix it ==")
+# The blocker on marketplace #5032: where `opencode` on PATH was a wrapper
+# script, resolution ran `npx --yes --package opencode-ai`, which downloads and
+# executes whatever the registry is serving — unreviewed code, run by a plugin
+# whose promise is that you see code before it runs. A wrapper must now simply
+# resolve to nothing.
+wrap_dir = tempfile.mkdtemp(prefix="plug-wrapper-")
+try:
+    wrapper = os.path.join(wrap_dir, "opencode")
+    # The shape Omarchy installs: a bash script that resolves the package at
+    # run time rather than being the program.
+    write_new(wrapper, '#!/bin/bash\necho "would fetch the package"\n', 0o755)
+    os.environ["PATH"] = wrap_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    ran = []
+    sv_rc = plugd.run_capped
+    try:
+        def spy(cmd, *a, **kw):
+            ran.append(list(cmd))
+            return sv_rc(cmd, *a, **kw)
+        plugd.run_capped = spy
+        got = plugd.resolve_opencode_bin()
+    finally:
+        plugd.run_capped = sv_rc
+    flat = " ".join(" ".join(c) for c in ran)
+    check("RED: the wrapper is on PATH and is what `which` finds",
+          shutil.which("opencode") == wrapper, str(shutil.which("opencode")))
+    check("GREEN: it resolves to nothing rather than to a fetched program",
+          got == "", repr(got))
+    check("GREEN: no package fetch was attempted",
+          "npx" not in flat and "opencode-ai" not in flat, flat[:120] or "(no commands run)")
+    check("and Opencode is not offered",
+          "opencode" not in {a["key"] for a in plugd.available_agents()})
+
+    # The model listing is the other way the wrapper could have been executed:
+    # it used to run the bare name `opencode`, which IS the wrapper.
+    ran2 = []
+    sv_rc2 = plugd.run_capped
+
+    def spy2(cmd, *a, **kw):
+        ran2.append(list(cmd))
+        return (0, "", "", False)
+    try:
+        plugd.run_capped = spy2
+        plugd.opencode_models("")
+    finally:
+        plugd.run_capped = sv_rc2
+    check("GREEN: opencode_models runs nothing without a resolved program",
+          ran2 == [], str(ran2)[:120])
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    shutil.rmtree(wrap_dir, ignore_errors=True)
+
+print()
+print("== G3. an installed package's own launcher is kept, and stays reachable ==")
+# Two things the wrapper refusal must not break.
+#
+# Opencode's own `bin/opencode` was a `/bin/sh` launcher in every release up
+# to 1.15.0 (the native `bin/opencode.exe` arrives in 1.15.1) — it runs the
+# platform binary beside it and fetches nothing, so refusing every script
+# would refuse an ordinary local install.
+#
+# And the path handed back has to be one a review can execute: the sandbox
+# binds the tree above `node_modules`, so returning the `.bin` link — which
+# npm puts outside that tree — gives the sandbox nothing to run.
+pkg_root = tempfile.mkdtemp(prefix="plug-pkg-")
+try:
+    pkg_bin = os.path.join(pkg_root, "lib", "node_modules", "opencode-ai", "bin")
+    os.makedirs(pkg_bin)
+    launcher = os.path.join(pkg_bin, "opencode")
+    write_new(launcher, '#!/bin/sh\necho "1.14.0"\n', 0o755)   # pre-1.15.1 shape
+    shim_dir = os.path.join(pkg_root, "bin")
+    os.makedirs(shim_dir)
+    os.symlink(launcher, os.path.join(shim_dir, "opencode"))
+    os.environ["PATH"] = shim_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    got = plugd.resolve_opencode_bin()
+    check("GREEN: a package's own `#!` launcher is accepted", bool(got), repr(got))
+    # RED unless the resolved path is returned: the link lives in
+    # <root>/bin while the sandbox is only given <root>/lib.
+    mount = plugd.opencode_package_dir(got) if got else ""
+    check("GREEN: the sandbox is given the tree the program is inside",
+          bool(got) and bool(mount) and got.startswith(mount.rstrip("/") + "/"),
+          "bin=%r mount=%r" % (got, mount))
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    shutil.rmtree(pkg_root, ignore_errors=True)
+
+print()
+print("== N. a state file an older version wrote does not survive the upgrade ==")
+# The README lists what Plug keeps on disk and invites people to check it, so
+# a file left behind by a previous version makes that list wrong.
+state_dir = tempfile.mkdtemp(prefix="plug-state-")
+saved_state = plugd.STATE_DIR
+try:
+    os.chmod(state_dir, 0o700)
+    plugd.STATE_DIR = state_dir
+    stale = os.path.join(state_dir, plugd.RETIRED_STATE_FILES[0])
+    keep = os.path.join(state_dir, "settings.json")
+    write_new(stale, "{}\n")
+    write_new(keep, "{}\n")
+    check("RED: the stale file is there to begin with", os.path.exists(stale))
+    plugd.ensure_state_dir()
+    check("GREEN: it is gone after the next run", not os.path.exists(stale))
+    check("and a state file still in use is untouched", os.path.exists(keep))
+finally:
+    plugd.STATE_DIR = saved_state
+    shutil.rmtree(state_dir, ignore_errors=True)
 
 print()
 print("== M. the probe uses the reviewer's environment, not your shell's ==")

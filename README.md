@@ -94,13 +94,23 @@ tools you actually have:
   environment it sees carries its own credentials and nothing else your shell
   or your real home was carrying. It reads the diff it was given and has
   nothing else to act with.
-- **Opencode** — if `opencode` and `bwrap` (bubblewrap) are both installed.
-  Opencode keeps its own tools, so it runs inside a sandbox: a read-only
-  system, a home that exists only in memory, and nothing of yours inside it
-  but Opencode itself and its credentials, with editing, shell commands and
-  web fetches denied. Its models are listed from Opencode, free tier first,
-  and the default is a free one — so it costs nothing unless you pick a model
-  that does.
+- **Opencode** — if the Opencode program and `bwrap` (bubblewrap) are both
+  already installed. Opencode keeps its own tools, so it runs inside a sandbox:
+  a read-only system, a home that exists only in memory, and nothing of yours
+  inside it but Opencode itself and its credentials, with editing, shell
+  commands and web fetches denied. Its models are listed from Opencode, free
+  tier first, and the default is a free one — so it costs nothing unless you
+  pick a model that does.
+
+  Plug never installs Opencode, and never downloads a package in order to run a
+  review. Some setups put a stand-in named `opencode` on your PATH that fetches
+  the package the first time it runs; Plug does not offer Opencode on those,
+  because using it would mean running whatever the registry served at that
+  moment — code no one has reviewed, from the plugin whose job is to show you
+  code before it runs. An Opencode that is genuinely installed is used as it
+  is, whether its entry point is a binary or the package's own launcher script.
+  `mise use -g npm:opencode-ai` is one way to install it, after which Plug
+  offers it.
 - **Local servers** — Ollama or LM Studio, if they are running. The review is a
   request to `localhost`, so **nothing leaves your machine** — a real LLM review
   that is completely private. Their loaded models are listed automatically.
@@ -167,9 +177,10 @@ review of that plugin: the verdict, the summary, and the two commits it was
 read between, which is what the apply is checked against), and
 `outcome.json` (the result of the last job — written when an install, update,
 restore or removal finishes, shown and deleted the next time Plug opens), and,
-if you use Opencode, `opencode-models.json` and `opencode-bin.json` (its model
-list and where its program actually lives, both cached so Plug does not ask
-again on every settings open).
+if you use Opencode, `opencode-models.json` (its model list, cached so Plug
+does not ask again on every settings open). A state file an earlier version of
+Plug wrote and this one does not is removed from that directory on the first
+run after an upgrade, so this list stays the whole of it.
 
 **Outside its own directory** — only in response to something you do:
 
@@ -201,30 +212,26 @@ reviewer you chose — the `claude` command, the `opencode` command inside a
 <name>`, where a reviewer's command on your PATH is a `mise` shim rather than
 the program itself.
 
-Two Opencode commands run **outside** the sandbox: `opencode models`, to list
-what it can run (at most once a day), and — only where `opencode` is a wrapper
-script rather than the program itself — `npx --yes --package opencode-ai --
-which opencode` once, to find the real program, which fetches the package from
-npm. That lookup runs while the reviewer list is built, so on a wrapper install
-it can happen as the shell starts; it is abandoned after a minute, and a
-failure is not retried for ten. The answer is cached either way.
+One Opencode command runs **outside** the sandbox: `models`, to list what it
+can run, at most once a day. It is run as the resolved program on your disk,
+never through a wrapper that would fetch anything to answer.
 
 **What runs when the shell starts.** Plug builds its reviewer list once, as the
 shell loads it. That run does four things: it looks for `claude` and `opencode`
 on your PATH, running `mise which` for the real program where either is a
-`mise` shim; it starts each one it found, once, with `--version` — under the
-same throwaway home, or inside the same sandbox, that a review would use, so a
-reviewer is offered only when it has been seen to run;
-an HTTP request to `localhost:11434` and `localhost:1234` to see whether Ollama
-or LM Studio is listening; and, if Opencode is installed and its saved model
-list is more than a day old, `opencode models` to refresh it — which on installs
-where `opencode` is a wrapper resolves its package through the network. That
-list is then read from disk until it ages out again, and a listing that fails is
-not retried for ten minutes.
+`mise` shim, and treating a stand-in that would fetch the program as nothing
+found; it starts each one
+it found, once, with `--version` — under the same throwaway home, or inside the
+same sandbox, that a review would use, so a reviewer is offered only when it has
+been seen to run; an HTTP request to `localhost:11434` and `localhost:1234` to
+see whether Ollama or LM Studio is listening; and, if Opencode's own program is
+installed and its saved model list is more than a day old, that program's
+`models` command to refresh it. The list is then read from disk until it ages
+out again, and a listing that fails is not retried for ten minutes.
 
 The two local-server requests go to the loopback interface and ask one question
-each — whether a local server is there. The model listing is the one startup
-step that can reach beyond this machine, and only on a wrapper install.
+each — whether a local server is there. Every program in that run is one already
+installed on your machine.
 
 `hyprctl binds` also runs at startup, to know which key combinations Hyprland
 has already taken. Everything the reviewer list needs is gathered in that one
@@ -319,7 +326,9 @@ Plug replaces `plugd.py`, so the edit goes with it.
 `git`, `python3`, `bash` and `hyprctl`, all of which Omarchy already provides.
 An AI reviewer is optional — without one, Plug uses its offline scan. The
 Opencode reviewer additionally needs `bwrap` (the `bubblewrap` package) for the
-sandbox it runs in, and is simply not offered without it.
+sandbox it runs in, and Opencode itself installed on the machine — a stand-in
+that would fetch the package at run time does not count. It is simply not
+offered without both.
 
 ## Licence
 

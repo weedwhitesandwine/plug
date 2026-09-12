@@ -39,8 +39,13 @@ CATALOG_FILE = os.path.join(STATE_DIR, "catalog.json")
 HISTORY_FILE = os.path.join(STATE_DIR, "locks.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 OUTCOME_FILE = os.path.join(STATE_DIR, "outcome.json")
-OPENCODE_BIN_FILE = os.path.join(STATE_DIR, "opencode-bin.json")
 OPENCODE_MODELS_FILE = os.path.join(STATE_DIR, "opencode-models.json")
+
+# Bare names, inside STATE_DIR only: state files earlier versions wrote, removed
+# on the next run so an upgrade does not leave a file behind that the README no
+# longer lists. `opencode-bin.json` cached where Opencode's program was found,
+# back when finding it could mean fetching a package.
+RETIRED_STATE_FILES = ("opencode-bin.json",)
 
 SELF_ID = "io.github.weedwhitesandwine.plug"
 
@@ -115,6 +120,14 @@ def ensure_state_dir():
     st = os.stat(STATE_DIR)
     if st.st_uid != os.getuid() or (st.st_mode & 0o022):
         raise RuntimeError("%s is not owner-only; refusing to write" % STATE_DIR)
+    for stale in RETIRED_STATE_FILES:
+        # Files an older version wrote and this one does not. Left behind they
+        # would make the README's list of what Plug keeps on disk wrong, which
+        # is a list people are invited to check.
+        try:
+            os.unlink(os.path.join(STATE_DIR, stale))
+        except OSError:
+            pass
 
 
 def read_capped(path, ceiling, follow=False):
@@ -960,7 +973,7 @@ def available_agents():
             models = spec["models"]
             default = spec["default_model"]
             if key == "opencode":
-                models = opencode_models()
+                models = opencode_models(binpath)
                 # With no model list there is no way to name a model at review
                 # time, and Opencode would then fall back to whatever the
                 # user's own configuration defaults to — possibly a billed
@@ -1254,12 +1267,6 @@ OPENCODE_MODELS_TTL = 24 * 60 * 60
 # the cache exists for — a listing that is slow or unreachable — is the case
 # that retries on every settings open, blocking the reviewer list each time.
 OPENCODE_MODELS_RETRY = 10 * 60
-# The same two bounds for finding Opencode's own program. The lookup reaches
-# the npm registry, and it now runs while the reviewer list is being built, so
-# it is capped well short of the shell waiting on it and a failure is not
-# repeated at every start.
-OPENCODE_BIN_TIMEOUT = 60
-OPENCODE_BIN_RETRY = 10 * 60
 
 
 def stamp_age(stamp):
@@ -1274,14 +1281,20 @@ def stamp_age(stamp):
     return a if a >= 0 else None
 
 
-def opencode_models():
+def opencode_models(binpath):
     """The models this Opencode can use, free ones first.
 
     Opencode ships models that need no account at all (the `opencode/…`
     tier) alongside provider models that spend the user's own API credit, so
     the free ones lead and one of them is the default. Nothing is hard-coded:
     the list comes from Opencode itself, cached for a day, and a listing that
-    fails keeps the last good answer."""
+    fails keeps the last good answer.
+
+    `binpath` is the resolved program, never the bare name: running `opencode`
+    off PATH would run a wrapper that fetches the package to answer, which is
+    the one thing this must not do."""
+    if not binpath:
+        return []
     age = stamp_age
     cached = read_json(OPENCODE_MODELS_FILE, 64 * 1024, {})
     have = []
@@ -1294,7 +1307,7 @@ def opencode_models():
         f = age(cached.get("failedAt"))
         if f is not None and f < OPENCODE_MODELS_RETRY:
             return have
-    code, out, _, _ = run_capped(["opencode", "models"], timeout=20,
+    code, out, _, _ = run_capped([binpath, "models"], timeout=20,
                                  cap=64 * 1024)
     names = [l.strip() for l in out.split("\n") if l.strip() and "/" in l]
     names = [n for n in names if len(n) <= 120][:60]
@@ -1320,47 +1333,40 @@ def opencode_package_dir(binpath):
 
 
 def resolve_opencode_bin():
-    """The real Opencode program. On some installs `opencode` on PATH is a
-    wrapper that resolves the package through npx at run time, which cannot
-    work inside the jail — so the resolved path is found once, cached, and
-    re-resolved if it goes stale."""
-    cached = read_json(OPENCODE_BIN_FILE, 64 * 1024, {})
-    if isinstance(cached, dict):
-        p = cached.get("bin", "")
-        if isinstance(p, str) and p and os.access(p, os.X_OK):
-            return p
-        # A resolution that failed is remembered for a short while. This runs
-        # when the reviewer list is built — at shell start — and the npx
-        # lookup below reaches the network, so a machine that cannot get to
-        # the registry would otherwise pay that wait at every single start.
-        f = stamp_age(cached.get("failedAt"))
-        if f is not None and f < OPENCODE_BIN_RETRY:
-            return ""
+    """Opencode's own program, if it is already installed on this machine.
+
+    Only a program that is here now is accepted. Where `opencode` on PATH is a
+    wrapper that fetches the package at run time, there is nothing installed
+    for it to name, and the answer is "" — Opencode is then not offered as a
+    reviewer. Plug never downloads a reviewer in order to run one: fetching a
+    package means executing whatever the registry is serving at that moment,
+    which is code nobody has reviewed, on a plugin whose whole purpose is to
+    show you code before it runs. Installing Opencode is the user's to do
+    (`mise use -g npm:opencode-ai`, or any install that puts the real program
+    on PATH), and it is offered from the moment one is there."""
     p = resolve_cli_bin("opencode")
     if not p:
         return ""
     try:
         # peek_head refuses to follow a symlink, and both npm and mise put a
         # package's programs in `.bin` as links — so ask about the file the
-        # link names rather than reading the link as a hard failure.
-        if peek_head(os.path.realpath(p), 2)[:2] != b"#!":
-            write_atomic(OPENCODE_BIN_FILE, {"bin": p, "resolvedAt": now_iso()})
-            return p
+        # link names. That resolved path is also what is returned: a review
+        # runs inside a sandbox holding the package tree around the program,
+        # and a `.bin` link can sit outside that tree, where the sandbox would
+        # have nothing to execute.
+        real = os.path.realpath(p)
+        is_script = peek_head(real, 2)[:2] == b"#!"
     except OSError:
         return ""
-    # A wrapper script. Ask it where the package's own binary lives, rather
-    # than guessing at any particular installer's layout.
-    code, out, _, _ = run_capped(
-        ["bash", "-lc",
-         'command -v npx >/dev/null 2>&1 || exit 1; '
-         'npx --yes --package opencode-ai -- which opencode 2>/dev/null'],
-        timeout=OPENCODE_BIN_TIMEOUT, cap=64 * 1024)
-    line = last_line(out)
-    if code == 0 and line and os.access(line, os.X_OK):
-        write_atomic(OPENCODE_BIN_FILE, {"bin": line, "resolvedAt": now_iso()})
-        return line
-    write_atomic(OPENCODE_BIN_FILE, {"bin": "", "failedAt": time.time()})
-    return ""
+    # A script is Opencode's own launcher when it is part of an installed
+    # package — releases up to 1.15.0 ship `bin/opencode` as a `/bin/sh`
+    # launcher that runs the platform binary sitting beside it, and refusing
+    # those would refuse an ordinary local install. A script anywhere else is
+    # the other kind of wrapper: the one that fetches the package at the
+    # moment it runs. That one resolves to nothing.
+    if is_script and opencode_package_dir(real) == real:
+        return ""
+    return real
 
 
 REVIEW_SYSTEM = (
