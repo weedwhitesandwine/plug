@@ -103,16 +103,21 @@ tools you actually have:
   pick a model that does.
 
   Plug never installs Opencode, and never downloads anything in order to run a
-  review. Omarchy puts a stand-in named `opencode` on your PATH that installs
-  the program the first time you run it, and Plug will not run that: doing so
-  would mean fetching and executing whatever a registry served at that moment,
-  which is code no one has reviewed, from the plugin whose job is to show you
-  code before it runs. It asks `mise` instead, which reports only what is
-  already installed — so on a machine where you have used Opencode even once,
-  it is found and offered. If nothing is installed yet, Opencode is not in the
-  list and Settings says so, with the command to install it; run `opencode`
-  once in a terminal, or `mise use -g opencode`, and it is there from the next
-  shell start.
+  review. Omarchy puts a stand-in named `opencode` on your PATH that goes and
+  gets the program when you run it, and Plug will not run that: doing so would
+  mean fetching and executing whatever a registry served at that moment, which
+  is code no one has reviewed, from the plugin whose job is to show you code
+  before it runs. It asks `mise` instead, which reports only what is already
+  installed. If Opencode is installed, it is found and offered — including
+  where the stand-in is shadowing it on your PATH. If it is not, Opencode is
+  absent from the list and Settings says why, with the command that installs
+  it: `mise use -g opencode`. It is offered from the next shell start.
+
+  Running the stand-in yourself is not enough on every machine. The current one
+  installs through mise, which Plug can find; an older one fetches the package
+  into npm's cache on each run and installs nothing, and a machine carrying
+  that one has no installed Opencode however many times it has been used.
+  `mise use -g opencode` is the answer in both cases.
 - **Local servers** — Ollama or LM Studio, if they are running. The review is a
   request to `localhost`, so **nothing leaves your machine** — a real LLM review
   that is completely private. Their loaded models are listed automatically.
@@ -221,9 +226,10 @@ never through a wrapper that would fetch anything to answer.
 
 **What runs when the shell starts.** Plug builds its reviewer list once, as the
 shell loads it. That run does four things: it looks for `claude` and `opencode`
-on your PATH, running `mise which` for the real program where either is a
-`mise` shim or a stand-in that would install the program when run; it starts
-each one
+on your PATH, running `mise which` for the real program wherever what it finds
+is a `mise` shim or a stand-in that would go and get the program — which
+applies to every reviewer, not only Opencode, and means a stand-in is never run
+to find out what it is; it starts each one
 it found, once, with `--version` — under the same throwaway home, or inside the
 same sandbox, that a review would use, so a reviewer is offered only when it has
 been seen to run; an HTTP request to `localhost:11434` and `localhost:1234` to
@@ -329,8 +335,9 @@ Plug replaces `plugd.py`, so the edit goes with it.
 `git`, `python3`, `bash` and `hyprctl`, all of which Omarchy already provides.
 An AI reviewer is optional — without one, Plug uses its offline scan. The
 Opencode reviewer additionally needs `bwrap` (the `bubblewrap` package) for the
-sandbox it runs in, and Opencode itself installed on the machine — running
-`opencode` once is enough to install it. It is simply not offered without both.
+sandbox it runs in, and Opencode itself installed on the machine
+(`mise use -g opencode`). It is simply not offered without both, and Settings
+says which one is missing.
 
 ## Licence
 

@@ -144,8 +144,8 @@ try:
     # GREEN: resolution asks about the file the link names, and returns it.
     os.environ["PATH"] = link_dir + ":" + PATH_SHIM_ONLY
     fresh()
-    got = plugd.resolve_opencode_bin()
-    check("GREEN: resolve_opencode_bin still finds the program",
+    got = plugd.resolve_cli_bin("opencode")
+    check("GREEN: resolution still finds the program",
           got == real_prog and os.access(got, os.X_OK), repr(got))
 finally:
     os.environ["PATH"] = PATH_SHIM_ONLY
@@ -163,7 +163,11 @@ try:
     wrapper = os.path.join(wrap_dir, "opencode")
     # The shape Omarchy installs: a bash script that resolves the package at
     # run time rather than being the program.
-    write_new(wrapper, '#!/bin/bash\necho "would fetch the package"\n', 0o755)
+    # The shape Omarchy actually writes: it fetches the package, then runs it.
+    write_new(wrapper,
+              '#!/bin/bash\npackage="opencode-ai"\n'
+              'bin=$(npx --yes --package "$package" -- which opencode)\n'
+              'exec "$bin" "$@"\n', 0o755)
     os.environ["PATH"] = wrap_dir + ":" + PATH_SHIM_ONLY
     fresh()
     ran = []
@@ -173,7 +177,7 @@ try:
             ran.append(list(cmd))
             return sv_rc(cmd, *a, **kw)
         plugd.run_capped = spy
-        got = plugd.resolve_opencode_bin()
+        got = plugd.resolve_cli_bin("opencode")
     finally:
         plugd.run_capped = sv_rc
     flat = " ".join(" ".join(c) for c in ran)
@@ -229,11 +233,11 @@ try:
     os.symlink(launcher, os.path.join(shim_dir, "opencode"))
     os.environ["PATH"] = shim_dir + ":" + PATH_SHIM_ONLY
     fresh()
-    got = plugd.resolve_opencode_bin()
+    got = plugd.resolve_cli_bin("opencode")
     check("GREEN: a package's own `#!` launcher is accepted", bool(got), repr(got))
     # RED unless the resolved path is returned: the link lives in
     # <root>/bin while the sandbox is only given <root>/lib.
-    mount = plugd.opencode_package_dir(got) if got else ""
+    mount = plugd.package_dir(got) if got else ""
     check("GREEN: the sandbox is given the tree the program is inside",
           bool(got) and bool(mount) and got.startswith(mount.rstrip("/") + "/"),
           "bin=%r mount=%r" % (got, mount))
@@ -266,19 +270,22 @@ try:
     write_new(os.path.join(stub_dir, "mise"),
               '#!/bin/sh\n'
               'if [ "$1" = "which" ] && [ "$2" = "opencode" ]; then\n'
-              '  [ "$MISE_AUTO_INSTALL" = "0" ] || { echo "AUTOINSTALL-ALLOWED" >&2; exit 3; }\n'
+              '  case "$MISE_AUTO_INSTALL" in 0|false) ;; *) echo "AUTOINSTALL-ALLOWED" >&2; exit 3;; esac\n'
               '  echo "%s"; exit 0\n'
               'fi\n'
               'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n' % program, 0o755)
     os.environ["PATH"] = stub_dir + ":" + PATH_SHIM_ONLY
     fresh()
-    got = plugd.resolve_opencode_bin()
+    got = plugd.resolve_cli_bin("opencode")
     check("RED: the stand-in is what `which` finds, and must not be run",
           os.path.basename(str(shutil.which("opencode"))) == "opencode"
           and shutil.which("opencode").startswith(stub_dir), str(shutil.which("opencode")))
     check("GREEN: the installed program is found anyway", got == program, repr(got))
+    # The stub refuses to answer unless installing was turned off, and accepts
+    # either spelling mise parses, so the check tests the guard rather than the
+    # literal chosen to express it.
     check("GREEN: mise was asked with installing turned off",
-          bool(got), "a fetch would have failed this check")
+          got == program, "the stub refuses to answer otherwise")
 
     # And when mise has nothing, it stays refused rather than installing one.
     write_new(os.path.join(stub_dir, "mise"),
@@ -287,7 +294,7 @@ try:
               'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n', 0o755)
     fresh()
     check("GREEN: nothing installed anywhere means not offered",
-          plugd.resolve_opencode_bin() == "")
+          plugd.resolve_cli_bin("opencode") == "")
 finally:
     os.environ["PATH"] = PATH_SHIM_ONLY
     fresh()
@@ -316,6 +323,53 @@ finally:
     os.environ["PATH"] = PATH_SHIM_ONLY
     fresh()
     shutil.rmtree(hint_dir, ignore_errors=True)
+
+print()
+print("== G6. the stand-in rule is not about Opencode ==")
+# Omarchy writes a stand-in for every CLI tool it ships — on this machine
+# gemini, pi and copilot carry the npx generation. Fixing this for Opencode
+# alone would have left the very same startup fetch in place for any other
+# reviewer whose PATH entry happened to be one.
+sole_dir = tempfile.mkdtemp(prefix="plug-standin-")
+try:
+    write_new(os.path.join(sole_dir, "claude"),
+              '#!/bin/bash\npackage="@anthropic-ai/claude-code"\n'
+              'exec npx --yes --package "$package" -- claude "$@"\n', 0o755)
+    # PATH without the mise shims, so a stand-in is genuinely all there is.
+    os.environ["PATH"] = sole_dir + ":/usr/local/bin:/usr/bin"
+    fresh()
+    plugd._AGENT_STARTS_CACHE.clear()
+    ran = []
+    sv = plugd.run_capped
+    try:
+        def spy(cmd, *a, **kw):
+            ran.append(list(cmd))
+            return sv(cmd, *a, **kw)
+        plugd.run_capped = spy
+        got = plugd.resolve_cli_bin("claude")
+        offered = {a["key"] for a in plugd.available_agents()}
+    finally:
+        plugd.run_capped = sv
+    flat = " ".join(" ".join(c) for c in ran)
+    check("RED: a claude stand-in is what `which` finds",
+          str(shutil.which("claude")).startswith(sole_dir), str(shutil.which("claude")))
+    check("GREEN: the stand-in is not taken for the program",
+          not got.startswith(sole_dir), repr(got))
+    # The property that matters. Whether a program is found behind it depends
+    # on the machine; that it is never run to find out does not.
+    check("GREEN: the stand-in is never executed",
+          sole_dir not in flat, flat[:140] or "(no commands run)")
+    check("GREEN: and no package fetch was attempted",
+          "npx" not in flat, flat[:140] or "(no commands run)")
+    # Here mise has claude installed, so resolution finds it behind the
+    # stand-in and claude stays offered — which is the point of asking.
+    check("the installed program behind it is still found and offered",
+          bool(got) and "claude" in offered, "%r %s" % (got, sorted(offered)))
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    plugd._AGENT_STARTS_CACHE.clear()
+    shutil.rmtree(sole_dir, ignore_errors=True)
 
 print()
 print("== N. a state file an older version wrote does not survive the upgrade ==")

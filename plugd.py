@@ -894,6 +894,51 @@ def mise_which(name, mise_bin=""):
     return ""
 
 
+# A stand-in is a few lines long and fetching is its whole purpose, so the head
+# of the file is where the evidence is. The patterns are the ways a script gets
+# a package and runs it: npm's own runners, and mise being told to install.
+STAND_IN_BYTES = 8 * 1024
+STAND_IN_PATTERNS = (
+    re.compile(r"\bnpx\b"),
+    re.compile(r"\bbunx\b"),
+    re.compile(r"\b(?:pnpm|yarn)\s+dlx\b"),
+    re.compile(r"\bnpm\s+(?:i|install|exec)\b"),
+    re.compile(r"\bmise\s+(?:use|install|x)\b"),
+)
+
+
+def is_stand_in(path):
+    """Whether this is a launcher that goes and gets the program, rather than
+    the program.
+
+    Omarchy writes one of these to `~/.local/bin` for every CLI tool it ships,
+    in two generations — an older one that runs the package through `npx
+    --yes` on every invocation, and a current one that installs through mise
+    and execs the result. Both fetch, and running either means executing
+    whatever a registry is serving at that moment.
+
+    What identifies one is that it resolves a package at run time, so that is
+    what is looked for: a script whose body drives a package manager or a
+    run-a-package tool. Being a script is not enough on its own — plenty of
+    real programs ship as one, `opencode-ai`'s own `bin/opencode` among them in
+    every release up to 1.15.0 — and neither is living outside a package tree.
+
+    Read to a ceiling like anything else, and only the head of the file: a
+    stand-in is a handful of lines and the fetch is the point of it, not a
+    detail buried in a large program."""
+    try:
+        head = peek_head(path, STAND_IN_BYTES)
+    except OSError:
+        return False
+    if head[:2] != b"#!":
+        return False
+    try:
+        body = head.decode("utf-8", "replace")
+    except UnicodeError:
+        return False
+    return any(p.search(body) for p in STAND_IN_PATTERNS)
+
+
 def _resolve_cli_bin(name):
     p = shutil.which(name)
     if not p:
@@ -901,12 +946,14 @@ def _resolve_cli_bin(name):
     try:
         real = os.path.realpath(p)
     except OSError:
-        return p
-    if os.path.basename(real) != "mise":
-        return p
-    # A shim: ask mise where the tool lives, here, with the user's real HOME —
-    # the one place the question can still be answered.
-    return mise_which(name, real)
+        return ""
+    # A shim, or a stand-in: ask mise where the tool is actually installed,
+    # here, with the user's real HOME — the one place the question can still be
+    # answered. mise's answer gets the same test as anything else on PATH.
+    if os.path.basename(real) == "mise" or is_stand_in(real):
+        got = mise_which(name, real if os.path.basename(real) == "mise" else "")
+        return "" if not got or is_stand_in(got) else got
+    return real
 
 
 # How long a reviewer gets to prove it can start, and how much of its answer
@@ -919,8 +966,6 @@ _AGENT_STARTS_CACHE = {}
 def agent_binary(key, spec):
     """The program a review of this agent would actually execute — one answer,
     used by the offer and by the review, so the two cannot disagree."""
-    if key == "opencode":
-        return resolve_opencode_bin()
     return resolve_cli_bin(spec["bin"])
 
 
@@ -940,7 +985,7 @@ def agent_starts(key, spec, binpath):
     work = tempfile.mkdtemp(prefix="plug-probe-")
     try:
         if spec.get("jail"):
-            pkg = opencode_package_dir(binpath)
+            pkg = package_dir(binpath)
             cmd, _ = jail_argv([binpath, "--version"],
                                ro_binds=((pkg, pkg),) if pkg else ())
             env, cwd = os.environ.copy(), None
@@ -980,35 +1025,42 @@ def agent_available(agent_key):
 def agent_hints(agents):
     """Why a reviewer that plainly could be here is not.
 
-    Only for the case where the reason is invisible and the user can act on it.
-    Opencode disappearing is exactly that: Omarchy puts a stand-in on PATH that
-    installs the program when it runs, so `opencode` looks installed, works in
-    a terminal, and is still not something Plug will run — and without a word
-    on screen that reads as Plug being broken rather than as a missing
-    install."""
+    Only where the reason is invisible and the user can act on it. Opencode is
+    the case: Omarchy puts a stand-in on PATH that fetches the program when it
+    runs, so `opencode` works in a terminal, looks installed, and is still not
+    something Plug will run — which without a word on screen reads as Plug
+    being broken.
+
+    Each hint is derived from the specific thing that is missing, never from
+    Opencode's absence from the list. A reviewer drops off that list for
+    several reasons — the model listing failed because the machine was offline,
+    the sandbox probe did not answer — and telling somebody to install what
+    they already installed is worse than saying nothing."""
     if "opencode" in {a["key"] for a in agents}:
         return []
-    p = shutil.which("opencode")
-    if not p:
-        return []
-    try:
-        real = os.path.realpath(p)
-        if peek_head(real, 2)[:2] != b"#!" or opencode_package_dir(real) != real:
-            return []
-    except OSError:
-        return []
-    if not have_jail():
-        return [{"title": "Opencode needs bubblewrap",
-                 "body": "Opencode keeps its own tools, so Plug only runs it "
-                         "inside a sandbox. Install bubblewrap and it appears "
-                         "here.",
-                 "command": "omarchy pkg add bubblewrap"}]
-    return [{"title": "Opencode is not installed",
-             "body": "What `opencode` runs on this machine downloads Opencode "
-                     "each time rather than being it, and Plug will not fetch "
-                     "a program in order to run a review. Install it once and "
-                     "it appears here.",
-             "command": "mise use -g opencode"}]
+    if shutil.which("opencode") is None:
+        return []                      # never heard of it; nothing to explain
+    installed = bool(resolve_cli_bin("opencode"))
+    jail = have_jail()
+    if installed and jail:
+        return []                      # present and sandboxable; the reason is
+                                       # something transient, not a missing part
+    if not installed:
+        body = ("What `opencode` runs on this machine fetches Opencode each "
+                "time rather than being it, and Plug will not fetch a program "
+                "in order to run a review. Install it once and it appears "
+                "here.")
+        if not jail:
+            body += (" Opencode also runs only inside a sandbox, so it needs "
+                     "the `bubblewrap` package as well.")
+        return [{"title": "Opencode is not installed",
+                 "body": body,
+                 "command": "mise use -g opencode"}]
+    return [{"title": "Opencode needs bubblewrap",
+             "body": "Opencode keeps its own tools, so Plug only runs it "
+                     "inside a sandbox. Install bubblewrap and it appears "
+                     "here.",
+             "command": "omarchy pkg add bubblewrap"}]
 
 
 def available_agents():
@@ -1375,7 +1427,7 @@ def opencode_models(binpath):
     return models
 
 
-def opencode_package_dir(binpath):
+def package_dir(binpath):
     """The directory to mount so a resolved node package binary can run: the
     tree above its node_modules, or the file itself for a plain binary."""
     real = os.path.realpath(binpath)
@@ -1384,47 +1436,6 @@ def opencode_package_dir(binpath):
     return real[:i] if i > 0 else real
 
 
-def resolve_opencode_bin():
-    """Opencode's own program, if it is already installed on this machine.
-
-    Only a program that is here now is accepted. Where `opencode` on PATH is a
-    wrapper that fetches the package at run time, there is nothing installed
-    for it to name, and the answer is "" — Opencode is then not offered as a
-    reviewer. Plug never downloads a reviewer in order to run one: fetching a
-    package means executing whatever the registry is serving at that moment,
-    which is code nobody has reviewed, on a plugin whose whole purpose is to
-    show you code before it runs. Installing Opencode is the user's to do
-    (`mise use -g npm:opencode-ai`, or any install that puts the real program
-    on PATH), and it is offered from the moment one is there."""
-    p = resolve_cli_bin("opencode")
-    if not p:
-        return ""
-    try:
-        # peek_head refuses to follow a symlink, and both npm and mise put a
-        # package's programs in `.bin` as links — so ask about the file the
-        # link names. That resolved path is also what is returned: a review
-        # runs inside a sandbox holding the package tree around the program,
-        # and a `.bin` link can sit outside that tree, where the sandbox would
-        # have nothing to execute.
-        real = os.path.realpath(p)
-        is_script = peek_head(real, 2)[:2] == b"#!"
-    except OSError:
-        return ""
-    # A script is Opencode's own launcher when it is part of an installed
-    # package — releases up to 1.15.0 ship `bin/opencode` as a `/bin/sh`
-    # launcher that runs the platform binary sitting beside it, and refusing
-    # those would refuse an ordinary local install.
-    #
-    # A script anywhere else is the other kind: a stand-in that goes and gets
-    # the program at the moment it runs. Running it is out of the question, but
-    # it does not follow that nothing is installed — Omarchy puts one of these
-    # on PATH for each of its tools, and the current one installs through mise,
-    # so on a machine where Opencode has been used even once the program itself
-    # is sitting there to be found. Ask mise, which answers only for what is
-    # already installed. If it has nothing, Opencode is not offered.
-    if is_script and opencode_package_dir(real) == real:
-        return mise_which("opencode")
-    return real
 
 
 REVIEW_SYSTEM = (
@@ -1720,7 +1731,7 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                 with os.fdopen(fd, "w") as f:
                     json.dump({"permission": {"edit": "deny", "bash": "deny",
                                               "webfetch": "deny"}}, f)
-                pkg = opencode_package_dir(binpath)
+                pkg = package_dir(binpath)
                 # Opencode's own credential store, if it has one. A key set
                 # up with `opencode auth login` lives here rather than in the
                 # environment, and without this the jailed reviewer has no
