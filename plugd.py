@@ -864,6 +864,36 @@ def resolve_cli_bin(name):
     return resolved
 
 
+def mise_which(name, mise_bin=""):
+    """Where mise has this tool installed on this machine, or "".
+
+    `mise which` reports the path of a tool that is already installed and is
+    the only question asked of mise here — nothing is installed to answer it.
+    That has to stay true, and it is not true by default: mise's `auto_install`
+    ships as `true`, so a tool named in the user's global config but not yet
+    present would be fetched and built to satisfy the question. It is turned
+    off for the asking, which leaves `mise which` reporting what is there and
+    failing for what is not.
+
+    From `/`, deliberately. mise answers for the directory it is asked in, and
+    it inherits whatever directory the shell happened to start in; a
+    `mise.toml` there naming a version that is not installed makes the tool
+    unresolvable and the reviewer would vanish from Settings for a reason that
+    has nothing to do with the reviewer. `/` asks for the user's own global
+    tools, which is what a plugin's reviewer runs on."""
+    m = mise_bin or shutil.which("mise")
+    if not m:
+        return ""
+    env = os.environ.copy()
+    env["MISE_AUTO_INSTALL"] = "0"
+    code, out, _, _ = run_capped([m, "which", name], timeout=30,
+                                 cap=64 * 1024, cwd="/", env=env)
+    line = last_line(out)
+    if code == 0 and line and os.access(line, os.X_OK):
+        return line
+    return ""
+
+
 def _resolve_cli_bin(name):
     p = shutil.which(name)
     if not p:
@@ -874,21 +904,9 @@ def _resolve_cli_bin(name):
         return p
     if os.path.basename(real) != "mise":
         return p
-    # Ask the shim's own program where the tool lives, here, with the user's
-    # real HOME — the one place the question can still be answered.
-    #
-    # From `/`, deliberately. mise answers for the directory it is asked in,
-    # and it inherits whatever directory the shell happened to start in; a
-    # `mise.toml` there naming a version that is not installed makes the tool
-    # unresolvable and the reviewer would vanish from Settings for a reason
-    # that has nothing to do with the reviewer. `/` asks for the user's own
-    # global tools, which is what a plugin's reviewer runs on.
-    code, out, _, _ = run_capped([real, "which", name], timeout=30,
-                                 cap=64 * 1024, cwd="/")
-    line = last_line(out)
-    if code == 0 and line and os.access(line, os.X_OK):
-        return line
-    return ""
+    # A shim: ask mise where the tool lives, here, with the user's real HOME —
+    # the one place the question can still be answered.
+    return mise_which(name, real)
 
 
 # How long a reviewer gets to prove it can start, and how much of its answer
@@ -1361,11 +1379,17 @@ def resolve_opencode_bin():
     # A script is Opencode's own launcher when it is part of an installed
     # package — releases up to 1.15.0 ship `bin/opencode` as a `/bin/sh`
     # launcher that runs the platform binary sitting beside it, and refusing
-    # those would refuse an ordinary local install. A script anywhere else is
-    # the other kind of wrapper: the one that fetches the package at the
-    # moment it runs. That one resolves to nothing.
+    # those would refuse an ordinary local install.
+    #
+    # A script anywhere else is the other kind: a stand-in that goes and gets
+    # the program at the moment it runs. Running it is out of the question, but
+    # it does not follow that nothing is installed — Omarchy puts one of these
+    # on PATH for each of its tools, and the current one installs through mise,
+    # so on a machine where Opencode has been used even once the program itself
+    # is sitting there to be found. Ask mise, which answers only for what is
+    # already installed. If it has nothing, Opencode is not offered.
     if is_script and opencode_package_dir(real) == real:
-        return ""
+        return mise_which("opencode")
     return real
 
 

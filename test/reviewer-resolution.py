@@ -243,6 +243,57 @@ finally:
     shutil.rmtree(pkg_root, ignore_errors=True)
 
 print()
+print("== G4. a fetching stand-in still finds a program mise has installed ==")
+# Omarchy puts a stand-in on PATH for each of its tools, so on the machines
+# this plugin is written for, the stand-in is what `which` finds. Refusing to
+# run it is right; concluding from that that nothing is installed is not.
+# mise is asked instead, and it must be asked in a way that cannot install.
+mise_dir = tempfile.mkdtemp(prefix="plug-mise-")
+try:
+    installed = os.path.join(mise_dir, "installs", "opencode", "bin")
+    os.makedirs(installed)
+    program = os.path.join(installed, "opencode")
+    write_new(program, '#!/bin/sh\necho "1.18.30"\n', 0o755)
+
+    stub_dir = os.path.join(mise_dir, "bin")
+    os.makedirs(stub_dir)
+    # The stand-in Omarchy writes: it installs the tool, then runs it.
+    write_new(os.path.join(stub_dir, "opencode"),
+              '#!/bin/bash\nmise use -g --quiet "opencode" || exit 1\n'
+              'exec mise x "opencode" -- "opencode" "$@"\n', 0o755)
+    # A mise that answers `which` for the installed program, and treats being
+    # asked to install as the failure it would be.
+    write_new(os.path.join(stub_dir, "mise"),
+              '#!/bin/sh\n'
+              'if [ "$1" = "which" ] && [ "$2" = "opencode" ]; then\n'
+              '  [ "$MISE_AUTO_INSTALL" = "0" ] || { echo "AUTOINSTALL-ALLOWED" >&2; exit 3; }\n'
+              '  echo "%s"; exit 0\n'
+              'fi\n'
+              'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n' % program, 0o755)
+    os.environ["PATH"] = stub_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    got = plugd.resolve_opencode_bin()
+    check("RED: the stand-in is what `which` finds, and must not be run",
+          os.path.basename(str(shutil.which("opencode"))) == "opencode"
+          and shutil.which("opencode").startswith(stub_dir), str(shutil.which("opencode")))
+    check("GREEN: the installed program is found anyway", got == program, repr(got))
+    check("GREEN: mise was asked with installing turned off",
+          bool(got), "a fetch would have failed this check")
+
+    # And when mise has nothing, it stays refused rather than installing one.
+    write_new(os.path.join(stub_dir, "mise"),
+              '#!/bin/sh\n'
+              'if [ "$1" = "which" ]; then echo "not a mise bin" >&2; exit 1; fi\n'
+              'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n', 0o755)
+    fresh()
+    check("GREEN: nothing installed anywhere means not offered",
+          plugd.resolve_opencode_bin() == "")
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    shutil.rmtree(mise_dir, ignore_errors=True)
+
+print()
 print("== N. a state file an older version wrote does not survive the upgrade ==")
 # The README lists what Plug keeps on disk and invites people to check it, so
 # a file left behind by a previous version makes that list wrong.
