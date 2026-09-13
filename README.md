@@ -195,6 +195,14 @@ run after an upgrade, so this list stays the whole of it.
 |---|---|
 | `~/.config/hypr/bindings.lua` | only when you set or clear a hotkey, and only Plug's own marked block, between `-- >>> plug hotkey` and `-- <<< plug hotkey`, along with the blank line it writes above that block. Resolved the same way if it is a dotfiles symlink |
 | `~/.config/omarchy/shell.json` | only when you show or hide the bar icon. It adds, moves or removes its own `{"id": …}` entry and leaves every other setting as it found it, though the file is rewritten as standard JSON with two-space indentation. Where a dotfiles manager has symlinked this path into its own repository, the link is resolved and the real file written, so the link survives |
+
+Both files are edited through a descriptor held open on the target's parent
+directory for the whole edit: the directory is opened one component at a time,
+refusing a symlink at any of them, and the read, the staging and the rename are
+all made through that descriptor rather than by name again. It is checked once
+more immediately before the rename, and the edit is refused if the path no
+longer leads to it. Bytes that are not valid UTF-8 are carried through
+`bindings.lua` unchanged.
 | a plugin's own checkout under `~/.config/omarchy/plugins/…` | `git fetch` against every installed plugin's remote each time the panel opens (the update check, which you can turn off with `autoCheck`) and each time you press **Check for updates**; and, for the one plugin you act on, a fast-forward when you update it or a `reset` when you restore it |
 | a temporary directory | three things, all deleted afterwards: a shallow clone of a plugin you asked Plug to check before installing; when you install, a clone of that repository's default branch pinned to the commit you read, which is what `omarchy plugin add` copies from; and — when you review an update — a copy of the incoming version's files extracted from the plugin's own repository, so the reviewer reads the new code rather than only the diff |
 
@@ -211,7 +219,7 @@ ping` / `summon` to bring Plug back afterwards; `omarchy plugin add` / `remove`
 state, fetch updates, show the diff, apply or revert); `hyprctl binds` (read
 active shortcuts) and `hyprctl reload` (after a hotkey change); `bash` (Plug's
 own `plug-ctl.sh`, which holds the two consent edits: the hotkey block and the
-bar-icon entry); `wl-copy` (only when you press **Copy the commands** on a
+bar-icon entry, both made by `plug-edit.py` beside it); `wl-copy` (only when you press **Copy the commands** on a
 manual install, with the commands passed as an argument rather than through a
 shell); `xdg-open` (only when you open a plugin's repository page); and the AI
 reviewer you chose — the `claude` command, the `opencode` command inside a
