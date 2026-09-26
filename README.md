@@ -118,6 +118,20 @@ tools you actually have:
   into npm's cache on each run and installs nothing, and a machine carrying
   that one has no installed Opencode however many times it has been used.
   `mise use -g opencode` is the answer in both cases.
+- **Cursor CLI** — if the `cursor-agent` command is installed and starts, and
+  `bwrap` (bubblewrap) is installed. Ask mode does not edit, but Cursor CLI
+  can still read your files, so it runs inside the same sandbox as Opencode:
+  a read-only system, a home that exists
+  only in memory, and nothing of yours inside it but Cursor CLI itself and
+  the account it already has (`~/.config/cursor/auth.json`, read-only). It is
+  started once, in ask mode, which does not edit, with its own sandbox turned
+  off because it is already inside one. The prompt is the only thing it is
+  given to read. Its models are listed from Cursor, with `auto` offered
+  first, so a review starts on Cursor's own default. Plug never installs
+  Cursor CLI and never runs a stand-in that would fetch it. If the command on
+  your PATH is that stand-in,
+  Settings says so, with the command that installs it:
+  `mise use -g cursor-agent`.
 - **Local servers** — Ollama or LM Studio, if they are running. The review is a
   request to `localhost`, so **nothing leaves your machine** — a real LLM review
   that is completely private. Their loaded models are listed automatically.
@@ -131,15 +145,17 @@ windows, not something Plug can call for a one-shot review.
 Authentication belongs to the reviewer you chose: Plug runs its command, and
 that command uses the sign-in it already has. With Claude Code, that is the
 Claude account set up in your terminal; with Opencode, whatever
-`opencode auth login` saved, or a provider key already in your environment. If
-the tool is not signed in, the review falls back to the offline scan.
+`opencode auth login` saved, or a provider key already in your environment;
+with Cursor CLI, whatever `cursor-agent login` saved, or `CURSOR_API_KEY`
+already in your environment. If the tool is not signed in, the review falls
+back to the offline scan.
 
-**Privacy.** A reviewer that runs somewhere else — Claude Code, or Opencode on
-a provider model — is sent the code it is asked to judge, and only then: the
-diff when you review an update, the plugin's full source when you check one
-before installing it. That code is public and comes from a public repository,
-but it does leave your machine. A local server (Ollama, LM Studio) or the
-offline scan keeps everything on it.
+**Privacy.** A reviewer that runs somewhere else — Claude Code, Opencode on
+a provider model, or Cursor CLI — is sent the code it is asked to judge, and
+only then: the diff when you review an update, the plugin's full source when
+you check one before installing it. That code is public and comes from a
+public repository, but it does leave your machine. A local server (Ollama,
+LM Studio) or the offline scan keeps everything on it.
 
 ## Install
 
@@ -185,7 +201,8 @@ read between, which is what the apply is checked against), and
 `outcome.json` (the result of the last job — written when an install, update,
 restore or removal finishes, shown and deleted the next time Plug opens), and,
 if you use Opencode, `opencode-models.json` (its model list, cached so Plug
-does not ask again on every settings open). A state file an earlier version of
+does not ask again on every settings open), and, if you use Cursor CLI,
+`cursor-models.json` (the same, for Cursor's models). A state file an earlier version of
 Plug wrote and this one does not is removed from that directory on the first
 run after an upgrade, so this list stays the whole of it.
 
@@ -223,18 +240,20 @@ bar-icon entry, both made by `plug-edit.py` beside it); `wl-copy` (only when you
 manual install, with the commands passed as an argument rather than through a
 shell); `xdg-open` (only when you open a plugin's repository page); and the AI
 reviewer you chose — the `claude` command, the `opencode` command inside a
-`bwrap` sandbox, or a request to a local server on `localhost`; and `mise which
+`bwrap` sandbox, the `cursor-agent` command inside that same sandbox, or a
+request to a local server on `localhost`; and `mise which
 <name>`, where a reviewer's command on your PATH is a shim or a stand-in rather
 than the program itself. That one is asked with mise's `auto_install` turned
 off, so it reports a tool that is installed and fails for one that is not.
 
-One Opencode command runs **outside** the sandbox: `models`, to list what it
-can run, at most once a day. It is run as the resolved program on your disk,
+One command per tool-keeping reviewer runs **outside** the sandbox: `models`,
+to list what it can run, at most once a day. That is Opencode's `models`, and
+Cursor CLI's `models`. Each is run as the resolved program on your disk,
 never through a wrapper that would fetch anything to answer.
 
 **What runs when the shell starts.** Plug builds its reviewer list once, as the
-shell loads it. That run does four things: it looks for `claude` and `opencode`
-on your PATH, running `mise which` for the real program wherever what it finds
+shell loads it. That run does four things: it looks for `claude`, `opencode`
+and `cursor-agent` on your PATH, running `mise which` for the real program wherever what it finds
 is a `mise` shim or a stand-in that would go and get the program — which
 applies to every reviewer, not only Opencode, and means a stand-in is never run
 to find out what it is; it starts each one
@@ -243,7 +262,8 @@ same sandbox, that a review would use, so a reviewer is offered only when it has
 been seen to run; an HTTP request to `localhost:11434` and `localhost:1234` to
 see whether Ollama or LM Studio is listening; and, if Opencode's own program is
 installed and its saved model list is more than a day old, that program's
-`models` command to refresh it. The list is then read from disk until it ages
+`models` command to refresh it — and the same for Cursor CLI, when its own
+program is installed. The list is then read from disk until it ages
 out again, and a listing that fails is not retried for ten minutes.
 
 The two local-server requests go to the loopback interface and ask one question
@@ -257,7 +277,8 @@ run, and it is the same list every time you open Settings afterwards.
 **Network:** each installed plugin's git remote, to check for and fetch updates;
 the repository of a store plugin you ask Plug to check before installing;
 the marketplace catalog on `raw.githubusercontent.com`; when you review an
-update with Claude Code, Anthropic — never otherwise. A local-server
+update with Claude Code, Anthropic; when you review with Cursor CLI, Cursor —
+never otherwise. A local-server
 reviewer stays on `localhost`.
 
 **When the catalog is fetched.** Starting the shell never fetches it — Plug
@@ -344,8 +365,9 @@ Plug replaces `plugd.py`, so the edit goes with it.
 An AI reviewer is optional — without one, Plug uses its offline scan. The
 Opencode reviewer additionally needs `bwrap` (the `bubblewrap` package) for the
 sandbox it runs in, and Opencode itself installed on the machine
-(`mise use -g opencode`). It is simply not offered without both, and Settings
-says which one is missing.
+(`mise use -g opencode`). Cursor CLI needs the same sandbox, and Cursor CLI
+itself installed (`mise use -g cursor-agent`). Either one is simply not
+offered without both, and Settings says which one is missing.
 
 ## Licence
 

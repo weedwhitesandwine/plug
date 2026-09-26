@@ -544,5 +544,127 @@ check("every offered agent has a usable default model",
       all(a["defaultModel"] for a in live.values()))
 
 print()
+print("== O. Cursor CLI reviews in ask mode, inside the sandbox ==")
+ids = ["gpt-5.3-codex-low", "auto", "gpt-5.3-codex",
+       "gpt-5.3-codex-high-fast", "grok-4.7-low", "grok-4.7-high",
+       "composer-2.5-fast", "composer-2.5"]
+choices = plugd.cursor_model_choices(ids)
+check("auto is offered first", choices[0] == "auto", str(choices))
+check("a family keeps its plain id",
+      "gpt-5.3-codex" in choices and "gpt-5.3-codex-low" not in choices
+      and "gpt-5.3-codex-high-fast" not in choices, str(choices))
+check("high stands in when the family has no plain id",
+      "grok-4.7-high" in choices and "grok-4.7-low" not in choices, str(choices))
+check("a fast-only twin is not its own chip",
+      "composer-2.5" in choices and "composer-2.5-fast" not in choices,
+      str(choices))
+parsed_ids = plugd.cursor_model_ids(
+    "Available models\n\nauto - Auto (default)\ngpt-5.2 - GPT-5.2\nnope\n")
+check("the model list keeps id - label lines",
+      parsed_ids == ["auto", "gpt-5.2"], str(parsed_ids))
+check("cursor_models runs nothing without a resolved program",
+      plugd.cursor_models("") == [])
+argv = plugd.cursor_review_argv("/opt/cursor-agent", "auto")
+check("the review is ask mode",
+      argv[argv.index("--mode") + 1] == "ask")
+check("the review is print mode", "--print" in argv)
+check("shell-allowing flags are not passed",
+      "--force" not in argv and "--yolo" not in argv)
+check("the model is an explicit argument",
+      argv[argv.index("--model") + 1] == "auto")
+
+cur_dir = tempfile.mkdtemp(prefix="plug-cursor-")
+try:
+    script = os.path.join(cur_dir, "cursor-agent")
+    write_new(script, "#!/bin/sh\necho 9.9.9\n", 0o755)
+    os.environ["PATH"] = cur_dir + ":" + PATH_SHIM_ONLY
+    fresh()
+    got = plugd.resolve_cli_bin("cursor-agent")
+    check("GREEN: the program resolves", got == os.path.realpath(script), repr(got))
+    mount = plugd.jail_bind_path(got, plugd.AGENTS["cursor"]) if got else ""
+    check("GREEN: the sandbox is given the directory the script execs from",
+          mount == os.path.dirname(os.path.realpath(script)), repr(mount))
+    seen = {}
+    sv_rc, sv_ls, sv_av = plugd.run_capped, plugd.load_settings, plugd.agent_available
+    saved_key = os.environ.get("CURSOR_API_KEY")
+    saved_agent = os.environ.get("CURSOR_AGENT")
+    os.environ["CURSOR_API_KEY"] = "test-key"
+    os.environ["CURSOR_AGENT"] = "1"
+    try:
+        plugd.load_settings = lambda: {"reviewAgent": "cursor",
+                                       "reviewModel": "auto"}
+        plugd.agent_available = lambda k: k == "cursor"
+
+        def spy(cmd, *a, **kw):
+            seen["cmd"] = list(cmd)
+            seen["stdin"] = kw.get("stdin")
+            return (0, "VERDICT: SAFE\nHEADLINE: Fine.\n"
+                    "WHAT CHANGED:\n- A comment.\nWATCH FOR: nothing notable\n",
+                    "", False)
+        plugd.run_capped = spy
+        res = plugd.run_agent("diff --git a b\n+x\n", {}, "TestPlugin")
+    finally:
+        plugd.run_capped, plugd.load_settings, plugd.agent_available = \
+            sv_rc, sv_ls, sv_av
+        if saved_key is None:
+            os.environ.pop("CURSOR_API_KEY", None)
+        else:
+            os.environ["CURSOR_API_KEY"] = saved_key
+        if saved_agent is None:
+            os.environ.pop("CURSOR_AGENT", None)
+        else:
+            os.environ["CURSOR_AGENT"] = saved_agent
+    cmd = seen.get("cmd") or []
+    check("GREEN: the review is wrapped in the sandbox",
+          bool(cmd) and os.path.basename(cmd[0]) == "bwrap", str(cmd[:6]))
+    check("GREEN: it runs the resolved program in ask mode",
+          "--mode" in cmd and got in cmd
+          and cmd[cmd.index("--mode") + 1] == "ask")
+    check("GREEN: it does not pass --force or --yolo",
+          "--force" not in cmd and "--yolo" not in cmd)
+    check("GREEN: only the account key is kept from the environment",
+          "CURSOR_API_KEY" in cmd and "CURSOR_AGENT" not in cmd
+          and cmd[cmd.index("CURSOR_API_KEY") + 1] == "test-key")
+    check("GREEN: the prompt is on stdin, not a dash argument",
+          seen.get("stdin") not in (None, subprocess.DEVNULL) and "-" not in cmd)
+    check("GREEN: a well-formed reply is the review",
+          res.get("verdict") == "SAFE" and res.get("agent") == "cursor",
+          str(res.get("verdict")))
+    check("the program tree is what the sandbox binds",
+          mount in cmd, mount)
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    shutil.rmtree(cur_dir, ignore_errors=True)
+
+print()
+print("== O2. a cursor stand-in says how to install it ==")
+cur_hint = tempfile.mkdtemp(prefix="plug-cursor-hint-")
+try:
+    write_new(os.path.join(cur_hint, "cursor-agent"),
+              '#!/bin/bash\nmise use -g --quiet "cursor-agent" || exit 1\n', 0o755)
+    write_new(os.path.join(cur_hint, "mise"),
+              '#!/bin/sh\nif [ "$1" = "which" ]; then exit 1; fi\n'
+              'echo "INSTALL-ATTEMPTED: $*" >&2\nexit 3\n', 0o755)
+    os.environ["PATH"] = cur_hint + ":/usr/local/bin:/usr/bin"
+    fresh()
+    hints = plugd.agent_hints([{"key": "claude"}])
+    check("RED: Cursor CLI is not offered",
+          "cursor" not in {a["key"] for a in plugd.available_agents()})
+    cursor_hints = [h for h in hints if "Cursor" in h.get("title", "")]
+    check("GREEN: a hint explains why", len(cursor_hints) == 1, str(hints)[:120])
+    check("and it carries the install command",
+          bool(cursor_hints) and cursor_hints[0].get("command") == "mise use -g cursor-agent",
+          cursor_hints[0].get("command") if cursor_hints else "")
+    check("no hint once Cursor CLI is offered",
+          plugd.agent_hints([{"key": "cursor"}]) == [] or
+          all("Cursor" not in h.get("title", "")
+              for h in plugd.agent_hints([{"key": "cursor"}])))
+finally:
+    os.environ["PATH"] = PATH_SHIM_ONLY
+    fresh()
+    shutil.rmtree(cur_hint, ignore_errors=True)
+
+print()
 print("FAILURES: %d" % len(fails), fails or "")
 sys.exit(1 if fails else 0)

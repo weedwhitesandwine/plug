@@ -40,6 +40,7 @@ HISTORY_FILE = os.path.join(STATE_DIR, "locks.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 OUTCOME_FILE = os.path.join(STATE_DIR, "outcome.json")
 OPENCODE_MODELS_FILE = os.path.join(STATE_DIR, "opencode-models.json")
+CURSOR_MODELS_FILE = os.path.join(STATE_DIR, "cursor-models.json")
 
 # Bare names, inside STATE_DIR only: state files earlier versions wrote, removed
 # on the next run so an upgrade does not leave a file behind that the README no
@@ -63,6 +64,15 @@ AGENTS = {
     "opencode": {
         "label": "Opencode (sandboxed)", "type": "cli", "bin": "opencode",
         "models": [], "default_model": "", "private": False, "jail": True,
+    },
+    # Cursor CLI keeps its tools even in ask mode (it can still read the
+    # filesystem), so a review runs inside the same jail as Opencode. It is
+    # only offered when bubblewrap can build one. Its model list comes from
+    # the CLI itself — account-specific, and too long to hard-code.
+    "cursor": {
+        "label": "Cursor CLI (sandboxed)", "type": "cli", "bin": "cursor-agent",
+        "models": [], "default_model": "", "private": False, "jail": True,
+        "mount": "dir",
     },
     "ollama": {
         "label": "Ollama (local, private)", "type": "http",
@@ -994,7 +1004,7 @@ def agent_starts(key, spec, binpath):
     work = tempfile.mkdtemp(prefix="plug-probe-")
     try:
         if spec.get("jail"):
-            pkg = package_dir(binpath)
+            pkg = jail_bind_path(binpath, spec)
             cmd, _ = jail_argv([binpath, "--version"],
                                ro_binds=((pkg, pkg),) if pkg else ())
             env, cwd = os.environ.copy(), None
@@ -1031,45 +1041,73 @@ def agent_available(agent_key):
     return False
 
 
-def agent_hints(agents):
-    """Why a reviewer that plainly could be here is not.
+def _tool_gap(agents, key, which_name, missing_title, missing_body,
+               jail_title, jail_body, install_command, also_jail):
+    """A hint for one reviewer, or None.
 
-    Only where the reason is invisible and the user can act on it. Opencode is
-    the case: Omarchy puts a stand-in on PATH that fetches the program when it
-    runs, so `opencode` works in a terminal, looks installed, and is still not
-    something Plug will run — which without a word on screen reads as Plug
-    being broken.
+    Only where the reason is invisible and the user can act on it. Omarchy
+    puts a stand-in on PATH that fetches the program when it runs, so the
+    command works in a terminal, looks installed, and is still not something
+    Plug will run.
 
-    Each hint is derived from the specific thing that is missing, never from
-    Opencode's absence from the list. A reviewer drops off that list for
+    The hint is derived from the specific thing that is missing, never from
+    the reviewer's absence from the list. A reviewer drops off that list for
     several reasons — the model listing failed because the machine was offline,
     the sandbox probe did not answer — and telling somebody to install what
     they already installed is worse than saying nothing."""
-    if "opencode" in {a["key"] for a in agents}:
-        return []
-    if shutil.which("opencode") is None:
-        return []                      # never heard of it; nothing to explain
-    installed = bool(resolve_cli_bin("opencode"))
+    if key in {a["key"] for a in agents}:
+        return None
+    if shutil.which(which_name) is None:
+        return None                    # never heard of it; nothing to explain
+    installed = bool(resolve_cli_bin(which_name))
     jail = have_jail()
     if installed and jail:
-        return []                      # present and sandboxable; the reason is
+        return None                    # present and sandboxable; the reason is
                                        # something transient, not a missing part
     if not installed:
-        body = ("What `opencode` runs on this machine fetches Opencode each "
-                "time rather than being it, and Plug will not fetch a program "
-                "in order to run a review. Install it once and it appears "
-                "here.")
+        body = missing_body
         if not jail:
-            body += (" Opencode also runs only inside a sandbox, so it needs "
-                     "the `bubblewrap` package as well.")
-        return [{"title": "Opencode is not installed",
-                 "body": body,
-                 "command": "mise use -g opencode"}]
-    return [{"title": "Opencode needs bubblewrap",
-             "body": "Opencode keeps its own tools, so Plug only runs it "
-                     "inside a sandbox. Install bubblewrap and it appears "
-                     "here.",
-             "command": "omarchy pkg add bubblewrap"}]
+            body += also_jail
+        return {"title": missing_title, "body": body,
+                "command": install_command}
+    return {"title": jail_title, "body": jail_body,
+            "command": "omarchy pkg add bubblewrap"}
+
+
+def agent_hints(agents):
+    """Why a reviewer that plainly could be here is not."""
+    hints = []
+    for hint in (
+        _tool_gap(
+            agents, "opencode", "opencode",
+            "Opencode is not installed",
+            "What `opencode` runs on this machine fetches Opencode each "
+            "time rather than being it, and Plug will not fetch a program "
+            "in order to run a review. Install it once and it appears here.",
+            "Opencode needs bubblewrap",
+            "Opencode keeps its own tools, so Plug only runs it inside a "
+            "sandbox. Install bubblewrap and it appears here.",
+            "mise use -g opencode",
+            " Opencode also runs only inside a sandbox, so it needs the "
+            "`bubblewrap` package as well."),
+        _tool_gap(
+            agents, "cursor", "cursor-agent",
+            "Cursor CLI is not installed",
+            "What `cursor-agent` runs on this machine fetches Cursor CLI each "
+            "time rather than being it, and Plug will not fetch a program "
+            "in order to run a review. Install it once and it appears here.",
+            "Cursor CLI needs bubblewrap",
+            "Ask mode does not edit, but Cursor CLI can still read your "
+            "files. Plug only runs it inside a sandbox, so the code it is "
+            "judging cannot reach the rest of your machine. Install "
+            "bubblewrap and it appears here.",
+            "mise use -g cursor-agent",
+            " Ask mode does not edit, but Cursor CLI can still read your "
+            "files, so it also needs the `bubblewrap` package."),
+    ):
+        if hint:
+            hints.append(hint)
+    return hints
 
 
 def available_agents():
@@ -1099,6 +1137,14 @@ def available_agents():
                 # provider credit. They can pick a paid one deliberately.
                 free = [m for m in models if m.startswith("opencode/")]
                 default = free[0] if free else models[0]
+            elif key == "cursor":
+                models = cursor_models(binpath)
+                # Without a named model the review would pass nothing and the
+                # jailed CLI, which cannot see the user's config, would pick
+                # its own. `auto` is Cursor's default, so it is the one offered.
+                if not models:
+                    continue
+                default = "auto" if "auto" in models else models[0]
         else:
             models = http_agent_models(spec)
             if not models:
@@ -1326,8 +1372,9 @@ def reviewer_env(workdir):
 #
 # Claude Code is run with no tools at all, so a trimmed environment and a
 # throwaway home are enough: it has nothing to act with. A reviewer that
-# keeps its tools — Opencode — needs the filesystem itself taken away,
-# because "read-only tools" still means reading whatever the user can read.
+# keeps its tools — Opencode, Cursor CLI — needs the filesystem itself taken
+# away, because "read-only tools" still means reading whatever the user can
+# read.
 # So it runs under bubblewrap: a tmpfs home, an empty working directory, a
 # read-only /usr, and nothing of the real home except the one binary it runs
 # from. Its own settings are replaced with a config that denies every tool,
@@ -1343,11 +1390,13 @@ def have_jail():
     return shutil.which("bwrap") is not None
 
 
-def jail_argv(argv, ro_binds=(), env_prefixes=JAIL_ENV_PREFIXES):
+def jail_argv(argv, ro_binds=(), env_prefixes=JAIL_ENV_PREFIXES, env_keys=()):
     """Wrap a command so it runs with no view of the real filesystem.
 
     `ro_binds` are (host, jail) pairs mounted read-only — the agent's own
-    program, and nothing else. Returns (argv, env)."""
+    program, and nothing else. `env_keys` are exact variable names to keep;
+    a prefix would also keep whatever else in the environment happened to
+    share it. Returns (argv, env)."""
     cmd = ["bwrap", "--die-with-parent", "--new-session",
            "--unshare-pid", "--unshare-uts", "--unshare-ipc",
            "--ro-bind", "/usr", "/usr",
@@ -1367,7 +1416,7 @@ def jail_argv(argv, ro_binds=(), env_prefixes=JAIL_ENV_PREFIXES):
             "--setenv", "TERM", "dumb",
             "--chdir", "/jail/work"]
     for k, v in os.environ.items():
-        if k.startswith(env_prefixes):
+        if k in env_keys or k.startswith(env_prefixes):
             cmd += ["--setenv", k, v]
     return cmd + list(argv), {}
 
@@ -1443,6 +1492,140 @@ def package_dir(binpath):
     marker = "/node_modules/"
     i = real.find(marker)
     return real[:i] if i > 0 else real
+
+
+def jail_bind_path(binpath, spec):
+    """What the sandbox is given so this program can start.
+
+    A package whose program lives under node_modules needs the tree above
+    that. Cursor CLI is a script that execs a node binary beside it, so the
+    directory holding the script is the tree — binding the script alone leaves
+    the sandbox with nothing to execute. A single binary is mounted as itself."""
+    if spec.get("mount") == "dir":
+        return os.path.dirname(os.path.realpath(binpath))
+    return package_dir(binpath)
+
+
+# Cursor's `models` lists every effort and speed variant of each model. Settings
+# draws one chip per entry, so the raw list fills the panel. These tails are
+# the variants; stripping them leaves the family.
+_CURSOR_VARIANT = re.compile(
+    r"-(?:thinking-)?(?:low|medium|high|xhigh|max)(?:-fast)?$|-fast$")
+CURSOR_MODELS_CAP = 24
+
+
+def _cursor_family(model_id):
+    cur = model_id
+    while True:
+        nxt = _CURSOR_VARIANT.sub("", cur)
+        if nxt == cur or not nxt:
+            return cur
+        cur = nxt
+
+
+def cursor_model_choices(ids):
+    """One model id per family, in the order Cursor listed them.
+
+    `auto` leads when Cursor offers it: that is the reviewer's default.
+    Within a family the plain id wins; otherwise a non-fast, non-thinking id,
+    preferring high, then medium, then low."""
+    families = []
+    seen = {}
+    for mid in ids:
+        if not isinstance(mid, str) or not MODEL_NAME_RE.fullmatch(mid):
+            continue
+        fam = _cursor_family(mid)
+        seen.setdefault(fam, []).append(mid)
+        if fam not in families:
+            families.append(fam)
+    chosen = []
+    for fam in families:
+        members = seen[fam]
+        if fam in members:
+            pick = fam
+        else:
+            plain = [m for m in members
+                     if "thinking" not in m and not m.endswith("-fast")]
+            pool = plain or members
+            pick = pool[0]
+            for suffix in ("-high", "-medium", "-low"):
+                hit = [m for m in pool if m.endswith(suffix)]
+                if hit:
+                    pick = hit[0]
+                    break
+        chosen.append(pick)
+        if len(chosen) >= CURSOR_MODELS_CAP:
+            break
+    if "auto" in chosen:
+        chosen = ["auto"] + [m for m in chosen if m != "auto"]
+    return chosen[:CURSOR_MODELS_CAP]
+
+
+def cursor_model_ids(out):
+    """Model ids from `cursor-agent models`. Each line is `id - label`."""
+    ids = []
+    for line in out.split("\n"):
+        line = line.strip()
+        if " - " not in line:
+            continue
+        mid = line.split(" - ", 1)[0].strip()
+        if MODEL_NAME_RE.fullmatch(mid) and mid not in ids:
+            ids.append(mid)
+    return ids
+
+
+def cursor_models(binpath):
+    """The models this Cursor CLI account can use, one per family.
+
+    The raw ids come from Cursor itself, cached for a day, and a listing that
+    fails keeps the last good answer. `auto` is placed first when it is in
+    the list. `binpath` is the resolved program, never the bare name: running
+    `cursor-agent` off PATH would run a wrapper that fetches the package to
+    answer, which is the one thing this must not do. Like Opencode's model
+    list, this runs outside the sandbox — it reads nothing of the plugin
+    under review."""
+    if not binpath:
+        return []
+    cached = read_json(CURSOR_MODELS_FILE, 64 * 1024, {})
+    have = []
+    fresh = False
+    if isinstance(cached, dict) and isinstance(cached.get("ids"), list):
+        have = [m for m in cached["ids"] if isinstance(m, str)]
+        a = stamp_age(cached.get("at"))
+        fresh = bool(have) and a is not None and a < OPENCODE_MODELS_TTL
+        if not fresh:
+            f = stamp_age(cached.get("failedAt"))
+            if f is not None and f < OPENCODE_MODELS_RETRY:
+                fresh = True
+    if not fresh:
+        code, out, _, _ = run_capped([binpath, "models"], timeout=20,
+                                     cap=64 * 1024)
+        ids = cursor_model_ids(out)
+        if code != 0 or not ids:
+            write_atomic(CURSOR_MODELS_FILE,
+                         {"at": cached.get("at", 0) if isinstance(cached, dict) else 0,
+                          "ids": have, "failedAt": time.time()})
+        else:
+            have = ids
+            write_atomic(CURSOR_MODELS_FILE, {"at": time.time(), "ids": have})
+    return cursor_model_choices(have)
+
+
+def cursor_review_argv(binpath, model):
+    """A one-shot, read-only Cursor CLI review.
+
+    Ask mode does not edit. Print mode is what makes it a script. Its own
+    sandbox is turned off because the process is already inside bubblewrap;
+    nesting another sandbox is how the review exits before it reads anything.
+    `--trust` is the workspace prompt, which nobody is there to answer.
+    `--force` and `--yolo` are deliberately absent: those allow shell
+    commands."""
+    argv = [binpath, "--print", "--mode", "ask", "--output-format", "text",
+            "--sandbox", "disabled", "--trust",
+            "--workspace", "/jail/work"]
+    if model:
+        argv += ["--model", model]
+    return argv
 
 
 
@@ -1766,6 +1949,50 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                     cmd, timeout=CLAUDE_TIMEOUT, cap=MAX_AGENT_BYTES,
                     env=os.environ.copy(), stdin=subprocess.DEVNULL)
                 raw = opencode_text(raw)
+            finally:
+                shutil.rmtree(jail, ignore_errors=True)
+        elif agent == "cursor":
+            binpath = agent_binary(agent, spec)
+            if not binpath:
+                raise ValueError("could not find Cursor CLI's own program to run")
+            # Named explicitly. The default offered in Settings is `auto`.
+            # An empty model would let the jailed run pick something else,
+            # because Cursor's own config is not mounted.
+            if not model:
+                raise ValueError("no model chosen for Cursor CLI")
+            if not have_jail():
+                raise ValueError("Cursor CLI keeps its tools, and there is "
+                                 "no sandbox to run it in")
+            jail = tempfile.mkdtemp(prefix="plug-review-")
+            try:
+                tree = jail_bind_path(binpath, spec)
+                # The account Cursor CLI already has. Read-only, and it is
+                # the reviewer's own credential — the same thing Claude Code
+                # is trusted with. Without it the jailed review has no account.
+                auth = os.path.join(HOME, ".config", "cursor", "auth.json")
+                binds = [(tree, tree)]
+                if os.path.exists(auth):
+                    binds.append((auth, "/jail/home/.config/cursor/auth.json"))
+                cmd, _ = jail_argv(
+                    cursor_review_argv(binpath, model),
+                    ro_binds=binds,
+                    env_keys=("CURSOR_API_KEY", "CURSOR_API_ENDPOINT"))
+                fd, tmp_prompt = tempfile.mkstemp(prefix=".plug-prompt.",
+                                                  dir=jail)
+                with os.fdopen(fd, "w") as f:
+                    f.write(REVIEW_SYSTEM + "\n\n" + prompt)
+                stdin_file = open(tmp_prompt, "rb")
+                os.unlink(tmp_prompt)
+                try:
+                    # stdin carries the prompt. A prompt argument would be
+                    # cut off once the source no longer fits in the argument
+                    # list, and a dash on its own is read as the prompt text.
+                    code, raw, _, _ = run_capped(
+                        cmd, timeout=CLAUDE_TIMEOUT, cap=MAX_AGENT_BYTES,
+                        env=os.environ.copy(), stdin=stdin_file)
+                finally:
+                    stdin_file.close()
+                raw = raw.strip()
             finally:
                 shutil.rmtree(jail, ignore_errors=True)
         else:
