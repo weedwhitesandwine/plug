@@ -142,13 +142,20 @@ Item {
     function ask() { if (running) pending = true; else running = true }
   }
 
+  // Qt 6.12 hands an array across a `var` signal or property as a sequence
+  // wrapper: it indexes, slices and maps like an array, but Array.isArray
+  // rejects it. Everything result() delivers has crossed that boundary.
+  function isList(v) {
+    return Array.isArray(v) || (v !== null && typeof v === "object" && typeof v.length === "number")
+  }
+
   Engine {
     id: rowsEngine
     sub: "rows"
     onResult: function(d) {
-      if (!d || !Array.isArray(d.community)) return
+      if (!d || !root.isList(d.community)) return
       root.installedRows = d.community
-      root.officialRows = Array.isArray(d.official) ? d.official : []
+      root.officialRows = root.isList(d.official) ? d.official : []
       if (root.pendingHighlight !== "") {
         for (var h = 0; h < d.community.length; h++)
           if (d.community[h].id === root.pendingHighlight) { root.selectedIndex = h; break }
@@ -551,7 +558,7 @@ Item {
     id: catalogRead
     sub: "print-catalog"
     onResult: function(d) {
-      if (d && Array.isArray(d.plugins)) {
+      if (d && root.isList(d.plugins)) {
         root.catalogRows = d.plugins
         root.catalogFetchedAt = (typeof d.fetchedAt === "string") ? d.fetchedAt : ""
         root.catalogLoaded = true
@@ -684,7 +691,7 @@ Item {
     id: settingsEngine
     sub: "print-settings"
     onResult: function(s) {
-      if (s && typeof s === "object" && !Array.isArray(s) && Object.keys(s).length > 0)
+      if (s && typeof s === "object" && !root.isList(s) && Object.keys(s).length > 0)
         root.settings = s
       root.settingsLoaded = true
       agentsEngine.ask()
@@ -698,10 +705,10 @@ Item {
     // reload that pairs a new panel with an engine mid-update does not blank
     // the reviewer list.
     onResult: function(a) {
-      if (Array.isArray(a)) { root.availableAgents = a; root.agentHints = [] }
+      if (root.isList(a)) { root.availableAgents = a; root.agentHints = [] }
       else if (a && typeof a === "object") {
-        root.availableAgents = Array.isArray(a.agents) ? a.agents : []
-        root.agentHints = Array.isArray(a.hints) ? a.hints : []
+        root.availableAgents = root.isList(a.agents) ? a.agents : []
+        root.agentHints = root.isList(a.hints) ? a.hints : []
       }
     }
   }
