@@ -14,18 +14,23 @@ staged under an exclusively-created name and renamed into place.
 """
 
 import argparse
+import http.client
+import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import socket
+import ssl
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -100,6 +105,15 @@ CLONE_TIMEOUT = 90
 MAX_INSTALL_BYTES = 256 * 1024 * 1024
 INSTALL_CLONE_TIMEOUT = 300
 CLAUDE_TIMEOUT = 180
+# A whole catalog download, start to end — generous for a slow link.
+CATALOG_DEADLINE = 300
+# Asking a local server for its models: the whole exchange, start to end.
+LOCAL_PROBE_DEADLINE = 3.0
+# A local server is trusted when it runs as you, or as an account at or below
+# this — the system accounts only root can create (Ollama's packaged service
+# runs as one). A listener belonging to another login is someone else's
+# program answering on a port your server left free.
+SYSTEM_UID_MAX = 999
 MAX_AGENT_BYTES = 512 * 1024
 MAX_SETTINGS_BYTES = 64 * 1024
 
@@ -728,19 +742,10 @@ def install_scripts(root, deadline=None):
 # --------------------------------------------------------- catalog
 
 def fetch_catalog_raw():
-    req = urllib.request.Request(CATALOG_URL,
-                                 headers={"User-Agent": "plug-omarchy-plugin/0.1"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        # urllib follows redirects on its own; a redirect must not walk this
-        # off https.
-        if not str(getattr(r, "url", "") or CATALOG_URL).startswith("https://"):
-            raise ValueError("a redirect took the catalog off https")
-        declared = r.headers.get("Content-Length")
-        if declared and declared.strip().isdigit() \
-                and int(declared) > MAX_REGISTRY_BYTES:
-            raise ValueError(_too_big())
-        raw = r.read(MAX_REGISTRY_BYTES + 1)
-    if len(raw) > MAX_REGISTRY_BYTES:
+    try:
+        raw = http_request(CATALOG_URL, MAX_REGISTRY_BYTES, CATALOG_DEADLINE,
+                           idle=30)
+    except TooBig:
         raise ValueError(_too_big())
     try:
         return json.loads(raw.decode("utf-8", "replace"))
@@ -816,10 +821,201 @@ def load_settings():
     return s
 
 
-def http_get_json(url, timeout=1.5):
-    req = urllib.request.Request(url, headers={"User-Agent": "plug/0.1"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read(2 * 1024 * 1024)
+# ------------------------------------------------------------- http
+#
+# Every web request goes through http_request(). It follows no redirect — a
+# redirect is refused with its body unread — reads the reply up to a ceiling
+# and no further, and holds the whole exchange (connect, send, headers, body)
+# to one wall-clock deadline: a watchdog severs the socket when it passes, so
+# a peer dripping bytes inside the idle timeout cannot hold a read open. A
+# request to a local reviewer also checks who is at the other end of the
+# connection before a byte is sent.
+
+class TooBig(ValueError):
+    pass
+
+
+def _proc_net_addr(ip, port):
+    """An address as /proc/net/tcp{,6} spells it: each 32-bit word of the
+    address in host byte order, then the port, in upper-case hex."""
+    ip = ip.split("%")[0]
+    fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    b = socket.inet_pton(fam, ip)
+    words = "".join("%08X" % struct.unpack("=I", b[i:i + 4])[0]
+                    for i in range(0, len(b), 4))
+    return "%s:%04X" % (words, port)
+
+
+def _server_side(sock):
+    """Where the kernel lists the server's side of this connection: each table
+    it can be in, with the (local, remote) pair it appears under there, seen
+    from the server. An IPv4 connection accepted by a dual-stack [::]
+    listener is listed in tcp6 under the IPv4-mapped spelling, so IPv4 is
+    looked for both ways."""
+    lip, lport = sock.getsockname()[:2]
+    rip, rport = sock.getpeername()[:2]
+    if sock.family == socket.AF_INET:
+        return [("/proc/net/tcp", (_proc_net_addr(rip, rport),
+                                   _proc_net_addr(lip, lport))),
+                ("/proc/net/tcp6", (_proc_net_addr("::ffff:" + rip, rport),
+                                    _proc_net_addr("::ffff:" + lip, lport)))]
+    return [("/proc/net/tcp6", (_proc_net_addr(rip, rport),
+                                _proc_net_addr(lip, lport)))]
+
+
+def loopback_peer_uid(sock):
+    """The owner of the program at the far end of this open connection, or
+    None. The kernel lists the server's side of the connection — the socket
+    its accept() returned, which carries the listener's owner — under the two
+    addresses, so this answers for the connection already held, not for
+    whatever is listening on the port by the time anyone asks again."""
+    for path, want in _server_side(sock):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                         | os.O_CLOEXEC)
+        except OSError:
+            continue
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            continue
+        with os.fdopen(fd, "r", encoding="ascii", errors="replace") as fh:
+            next(fh, None)
+            # One line at a time: the table is as long as the machine's
+            # socket count, and nothing of it is kept.
+            for line in fh:
+                f = line.split()
+                if len(f) > 7 and (f[1], f[2]) == want:
+                    try:
+                        return int(f[7])
+                    except ValueError:
+                        return None
+    return None
+
+
+def check_local_peer(sock):
+    ip = ipaddress.ip_address(sock.getpeername()[0].split("%")[0])
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    if not ip.is_loopback:
+        raise ValueError("localhost resolved to %s, off this machine" % ip)
+    uid = loopback_peer_uid(sock)
+    if uid is None:
+        raise ValueError("could not tell who runs the server on that port")
+    if uid != os.getuid() and uid > SYSTEM_UID_MAX:
+        raise ValueError("the server on that port belongs to another account "
+                         "(uid %d), not to you or the system" % uid)
+
+
+def http_request(url, cap, deadline, data=None, headers=None, local=False,
+                 idle=None):
+    """One request, bounded every way it can grow. https only, unless `local`,
+    where plain http to a loopback server whose owner checks out is allowed.
+    Returns the body; raises TooBig past `cap`, TimeoutError past `deadline`
+    seconds, ValueError for a refusal and OSError for a network failure."""
+    idle = min(idle or deadline, deadline)
+    u = urllib.parse.urlsplit(url)
+    if u.scheme == "https":
+        tls = True
+    elif u.scheme == "http" and local:
+        tls = False
+    else:
+        raise ValueError("refusing a request that is not https: %s" % url)
+    host = u.hostname or ""
+    port = u.port or (443 if tls else 80)
+    path = (u.path or "/") + ("?" + u.query if u.query else "")
+    hdrs = {"User-Agent": "plug/0.1"}
+    hdrs.update(headers or {})
+
+    # The watchdog runs from before the connect. It severs whichever socket
+    # is current — the TLS one replaces the plain one at the handshake — and
+    # the lock keeps it off a socket that has already been closed, whose
+    # descriptor number may by then belong to something else.
+    lock = threading.Lock()
+    live = {"sock": None, "done": False}
+    expired = threading.Event()
+
+    def _sever():
+        with lock:
+            if live["done"]:
+                return
+            expired.set()
+            if live["sock"] is not None:
+                try:
+                    # The plain socket's shutdown, under TLS too: it cuts the
+                    # descriptor without touching the TLS object another
+                    # thread is reading through.
+                    socket.socket.shutdown(live["sock"], socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def _hold(s):
+        with lock:
+            live["sock"] = s
+        if expired.is_set():
+            raise OSError("deadline passed")
+
+    watchdog = threading.Timer(deadline, _sever)
+    watchdog.daemon = True
+    watchdog.start()
+    conn = None
+    raw = bytearray()
+    try:
+        try:
+            sock = socket.create_connection((host, port), timeout=idle)
+            _hold(sock)
+            if local:
+                check_local_peer(sock)
+            if tls:
+                sock = ssl.create_default_context().wrap_socket(
+                    sock, server_hostname=host, do_handshake_on_connect=False)
+                _hold(sock)
+                sock.do_handshake()
+            conn = (http.client.HTTPSConnection if tls
+                    else http.client.HTTPConnection)(host, port, timeout=idle)
+            conn.sock = sock
+            conn.request("POST" if data is not None else "GET", path,
+                         body=data, headers=hdrs)
+            resp = conn.getresponse()
+            if not 200 <= resp.status < 300:
+                raise ValueError("the server answered %d%s" % (
+                    resp.status, " (a redirect, not followed)"
+                    if 300 <= resp.status < 400 else ""))
+            declared = resp.getheader("Content-Length")
+            if declared and declared.strip().isdigit() \
+                    and int(declared) > cap:
+                raise TooBig("the reply is larger than %d bytes" % cap)
+            while len(raw) <= cap:
+                chunk = resp.read1(min(65536, cap + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw += chunk
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            # A severed socket surfaces as a reset, a TLS error or truncated
+            # framing; it was the deadline either way.
+            if expired.is_set():
+                raise TimeoutError("no complete reply within %d seconds"
+                                   % deadline) from None
+            if isinstance(e, http.client.HTTPException):
+                raise OSError(str(e) or type(e).__name__) from None
+            raise
+    finally:
+        with lock:
+            live["done"] = True
+        watchdog.cancel()
+        if conn is not None:
+            conn.close()
+        elif live["sock"] is not None:
+            live["sock"].close()
+    if expired.is_set():
+        raise TimeoutError("no complete reply within %d seconds" % deadline)
+    if len(raw) > cap:
+        raise TooBig("the reply ran past %d bytes" % cap)
+    return bytes(raw)
+
+
+def http_get_json(url):
+    raw = http_request(url, 2 * 1024 * 1024, LOCAL_PROBE_DEADLINE,
+                       local=True, idle=1.5)
     return json.loads(raw.decode("utf-8", "replace"))
 
 
@@ -1573,14 +1769,10 @@ def openai_chat(base, model, system, user):
         "stream": False,
         "temperature": 0.2,
     }).encode("utf-8")
-    req = urllib.request.Request(
-        base.rstrip("/") + "/v1/chat/completions", data=body,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "plug/0.1"})
-    with urllib.request.urlopen(req, timeout=CLAUDE_TIMEOUT) as r:
-        raw = r.read(MAX_AGENT_BYTES + 1)
-    if len(raw) > MAX_AGENT_BYTES:
-        raise ValueError("reviewer replied with more than %d bytes" % MAX_AGENT_BYTES)
+    raw = http_request(base.rstrip("/") + "/v1/chat/completions",
+                       MAX_AGENT_BYTES, CLAUDE_TIMEOUT, data=body,
+                       headers={"Content-Type": "application/json"},
+                       local=True)
     doc = json.loads(raw.decode("utf-8", "replace"))
     choices = doc.get("choices") if isinstance(doc, dict) else None
     if choices and isinstance(choices, list):
@@ -1770,8 +1962,7 @@ def run_agent(diff, scan_facts, plugin_name, context="update",
                 shutil.rmtree(jail, ignore_errors=True)
         else:
             return offline_summary(diff, scan_facts, plugin_name, context)
-    except (OSError, subprocess.SubprocessError, urllib.error.URLError,
-            ValueError) as e:
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
         return reviewer_failed_summary(diff, scan_facts, plugin_name, context,
                                        agent, "could not run (%s)" % e)
     parsed = parse_review(raw)
@@ -2528,10 +2719,10 @@ def main():
             c = build_catalog()
             print(json.dumps({"ok": True, "count": c["count"],
                               "truncated": bool(c.get("truncated"))}))
-        except urllib.error.URLError as e:
+        except OSError as e:
             print(json.dumps({"ok": False, "error":
                               "could not reach the marketplace (%s)"
-                              % str(getattr(e, "reason", e))[:120]}))
+                              % str(e)[:120]}))
         except Exception as e:
             print(json.dumps({"ok": False, "error": str(e)[:200]}))
     elif args.cmd == "agents":

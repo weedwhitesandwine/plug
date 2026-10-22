@@ -302,6 +302,13 @@ shell process that stays up for days, so all of it is treated as data:
   memory, nothing of yours inside it but the reviewer's own program and
   credentials, editing and shell commands and web fetches denied — and is not
   offered if that sandbox cannot be built.
+- Every web request — the marketplace catalog, and the requests to a local
+  Ollama or LM Studio server — is held to one deadline from connecting to the
+  last byte and read to a size ceiling, and a redirect is refused with its
+  reply unread. Before a local server is sent anything, Plug checks which
+  account owns the program at the other end of that same connection, and
+  goes ahead only for you or a system account (uid below 1000). A program
+  another login has started on a port your server left free is refused.
 - The reviewer is told that comments in what it reads were written by whoever
   wrote the code, so a payload labelled "harmless test fixture" is judged by
   what it does.
